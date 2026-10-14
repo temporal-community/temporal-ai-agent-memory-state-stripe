@@ -240,7 +240,7 @@ Talk from the quick hits on each slide.
 - **What it won't do:** make the model's choice right. Evals and guardrails do.
 
 **Detail:** [How other approaches compare](../README.md#how-other-approaches-compare),
-[What it is not](../README.md#what-it-is-not).
+[What this demo is not](../README.md#what-this-demo-is-not).
 
 ### 10:45-11:30 Cost
 

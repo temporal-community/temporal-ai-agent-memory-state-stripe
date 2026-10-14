@@ -17,12 +17,6 @@ can leave a customer repeating themselves, or leave a job half done. Managing
 that well starts with knowing the difference between an agent's memory and its
 state.
 
-<!-- The first paragraph talks about two things: memory and state. 
-The following paragraph talks about context, long-term memory, and state. 
-It looks like what's going on here is that you've got two flavors of 
-memory, and then two flavors of state. I've adjusted the list to 
-address that. -->
-
 This repo steps you through that difference with a working demo and the
 resources behind it. An agent works with different kinds of information, and
 the demo explains several of them:
@@ -821,7 +815,7 @@ Each row is scoped to the linked pages as read on 2026-09-29.
 | [Anthropic memory tool](https://platform.claude.com/docs/en/agents-and-tools/tool-use/memory-tool), context editing, and compaction | `/memories` files the model writes and your app stores.<br>Context editing and compaction manage what fits in the window | Your app, from the files the model wrote | Good for coding agents.<br>For a refund, a crash between Stripe accepting it and the note being written loses the record that it went out |
 | [Postgres job table](https://brandur.org/idempotency-keys) | One row per request with a `recovery_point` | A completer process you write | Real execution state.<br>You build the leases, retries, timeouts, durable waits, and inspection.<br>Fixed recovery points suit a fixed pipeline. This loop's steps are chosen by a policy or model at run time |
 | [DBOS](https://docs.dbos.dev/integrations/openai-agents) | Checkpointed steps in Postgres or SQLite | The app, from the last completed step | The same category as Temporal, run as a library with no separate server |
-| Temporal (this demo) | Event History of Signals and Activity inputs and results.<br>Workflow fields rebuilt by replay | Any Worker polling the Task Queue | Not tied to a framework.<br>Per-Activity retry and heartbeat policies, durable waits, and the Web UI.<br>Its costs are under [What it is not](#what-it-is-not) |
+| Temporal (this demo) | Event History of Signals and Activity inputs and results.<br>Workflow fields rebuilt by replay | Any Worker polling the Task Queue | Not tied to a framework.<br>Per-Activity retry and heartbeat policies, durable waits, and the Web UI.<br>Its costs are under [What this demo is not](#what-this-demo-is-not) |
 
 </details>
 
@@ -892,6 +886,8 @@ key, so Stripe makes one refund.
 - Keep rejecting live Stripe keys.
 
 </details>
+
+<a id="what-it-is-not"></a>
 
 ## What this demo is not
 
@@ -1003,8 +999,9 @@ and Temporal Cloud credits when available. -->
 
 ## Acknowledgments
 
-Thanks to Cecil, Johann, Tushar, Tom, Melissa, and Cornelia for the reviews
-that shaped how this repository frames memory and state.
+Thanks to Cecil, Johann, Tushar, Tom, Melissa, Cornelia, and Brian for the
+reviews that shaped how this repository frames memory and state, and to Duncan
+for the call to action.
 
 ## License
 
