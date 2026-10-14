@@ -17,18 +17,26 @@ can leave a customer repeating themselves, or leave a job half done. Managing
 that well starts with knowing the difference between an agent's memory and its
 state.
 
+<!-- The first paragraph talks about two things: memory and state. 
+The following paragraph talks about context, long-term memory, and state. 
+It looks like what's going on here is that you've got two flavors of 
+memory, and then two flavors of state. I've adjusted the list to 
+address that. -->
+
 This repo steps you through that difference with a working demo and the
 resources behind it. An agent works with different kinds of information, and
-the demo explains three of them:
+the demo explains several of them:
 
-- **Context:** what the agent has in front of it for the current decision: the
-  request, the conversation so far, and the results of its last steps. The
-  model reasons only on what's in context, so what goes in, and what's left
-  out, shapes every choice it makes. It's sometimes called working memory.
-- **Long-term memory:** what the agent carries from one run to the next.
-  Memory comes in many types, such as past cases (episodic), facts (semantic),
-  and how-to instructions (procedural). It lives in a store you own, and the
-  agent pulls from it into context when it needs it.
+- **Memory:** what the agent knows as part of its own system. Memory comes in
+  two flavors, depending on the longevity of the data:
+  - **Context:** what the agent has in front of it for the current decision: the
+    request, the conversation so far, and the results of its last steps. The
+    model reasons only on what's in context, so what goes in, and what's left
+    out, shapes every choice it makes. It's sometimes called working memory.
+  - **Long-term memory:** what the agent carries from one run to the next.
+    Memory comes in many types, such as past cases (episodic), facts (semantic),
+    and how-to instructions (procedural). It lives in a store you own, and the
+    agent pulls from it into context when it needs it.
 - **State:** the facts the agent relies on but doesn't own, each kept by the
   system that owns it. State comes in many types, such as execution,
   authorization, effect, and domain state, and this demo shows two of them:
@@ -39,8 +47,8 @@ the demo explains three of them:
     refund, actually happened. The system that performed it, Stripe in this
     demo, is the source of truth.
 
-The goal is to make clear what context, long-term memory, and state are for an
-agent, so you can build agents that run longer and take on more complex work.
+When you know what context, long-term memory, and state are for an
+agent, you can build agents that run longer and take on more complex work.
 The demo stops the same agent mid-task twice, once without Temporal and once
 with it, so you can see where each kind of information lives and which ones
 survive a crash. A memory store can bring back what an agent knew, but it can't
@@ -885,7 +893,7 @@ key, so Stripe makes one refund.
 
 </details>
 
-## What it is not
+## What this demo is not
 
 - **Not a production refund service.** It leaves out authentication, a
   production database, a web application, multi-agent orchestration, and
