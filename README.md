@@ -67,7 +67,8 @@ process. A new process can then pick up the work.
 
 <a id="see-the-idea-in-15-seconds"></a>[![The demo in eight frames. Demo 1, without Temporal: the agent process collects two answers and two lookups and chooses issue refund, then shows PROCESS GONE. The new agent process has no answers and no next step, checks the offline ledger (paid, no refund), and tells the customer to start the return again. Demo 2, with Temporal: after WORKER GONE, the What Survives pane reads from Temporal 2 customer answers, 2 completed lookups, and next action issue refund. The new Temporal Worker shows NO REPEATED QUESTIONS and NO LOOP RESTART, says "Your refund is complete," and the ledger shows the refund SUCCEEDED.](assets/demo-reel.gif)](assets/demo-reel.mp4)
 
-- **Deck:** [*Agentic Memory and State*, August 2026 (PDF)](docs/agentic-memory-and-state.pdf)
+- **Slides from the video:** [*Agentic Memory and State*, October 2026 (PDF)](docs/agentic-memory-and-state.pdf)
+- **Slides from the TAI meetup:** [*Agentic Memory and State*, in English and Japanese (PDF)](docs/agentic-memory-and-state-tai-meetup.pdf)
 - **Video:** link after publish
 
 **Last verified:** 2026-10-06 (offline demo, failure path, tests). Live model
@@ -600,7 +601,7 @@ src/refund_agent/tui.py              terminal panels and the Event History read
 src/refund_agent/cli.py              refund-demo commands: start, stop, result, inspect, watch, usage, cleanup, and more
 src/refund_agent/permission_chat.py  authorization companion demo
 assets/                              demo reel, screenshots, architecture diagram
-docs/                                guide, history growth, talk notes, deck
+docs/                                guide, history growth, talk notes, decks
 tests/                               agent loop, ledger, stage, settings, and panel tests
 ```
 
