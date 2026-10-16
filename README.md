@@ -19,16 +19,18 @@ state.
 
 This repo steps you through that difference with a working demo and the
 resources behind it. An agent works with different kinds of information, and
-the demo explains three of them:
+the demo explains several of them:
 
-- **Context:** what the agent has in front of it for the current decision: the
-  request, the conversation so far, and the results of its last steps. The
-  model reasons only on what's in context, so what goes in, and what's left
-  out, shapes every choice it makes. It's sometimes called working memory.
-- **Long-term memory:** what the agent carries from one run to the next.
-  Memory comes in many types, such as past cases (episodic), facts (semantic),
-  and how-to instructions (procedural). It lives in a store you own, and the
-  agent pulls from it into context when it needs it.
+- **Memory:** what the agent knows as part of its own system. Memory comes in
+  two flavors, depending on the longevity of the data:
+  - **Context:** what the agent has in front of it for the current decision: the
+    request, the conversation so far, and the results of its last steps. The
+    model reasons only on what's in context, so what goes in, and what's left
+    out, shapes every choice it makes. It's sometimes called working memory.
+  - **Long-term memory:** what the agent carries from one run to the next.
+    Memory comes in many types, such as past cases (episodic), facts (semantic),
+    and how-to instructions (procedural). It lives in a store you own, and the
+    agent pulls from it into context when it needs it.
 - **State:** the facts the agent relies on but doesn't own, each kept by the
   system that owns it. State comes in many types, such as execution,
   authorization, effect, and domain state, and this demo shows two of them:
@@ -39,8 +41,8 @@ the demo explains three of them:
     refund, actually happened. The system that performed it, Stripe in this
     demo, is the source of truth.
 
-The goal is to make clear what context, long-term memory, and state are for an
-agent, so you can build agents that run longer and take on more complex work.
+When you know what context, long-term memory, and state are for an
+agent, you can build agents that run longer and take on more complex work.
 The demo stops the same agent mid-task twice, once without Temporal and once
 with it, so you can see where each kind of information lives and which ones
 survive a crash. A memory store can bring back what an agent knew, but it can't
@@ -813,7 +815,7 @@ Each row is scoped to the linked pages as read on 2026-09-29.
 | [Anthropic memory tool](https://platform.claude.com/docs/en/agents-and-tools/tool-use/memory-tool), context editing, and compaction | `/memories` files the model writes and your app stores.<br>Context editing and compaction manage what fits in the window | Your app, from the files the model wrote | Good for coding agents.<br>For a refund, a crash between Stripe accepting it and the note being written loses the record that it went out |
 | [Postgres job table](https://brandur.org/idempotency-keys) | One row per request with a `recovery_point` | A completer process you write | Real execution state.<br>You build the leases, retries, timeouts, durable waits, and inspection.<br>Fixed recovery points suit a fixed pipeline. This loop's steps are chosen by a policy or model at run time |
 | [DBOS](https://docs.dbos.dev/integrations/openai-agents) | Checkpointed steps in Postgres or SQLite | The app, from the last completed step | The same category as Temporal, run as a library with no separate server |
-| Temporal (this demo) | Event History of Signals and Activity inputs and results.<br>Workflow fields rebuilt by replay | Any Worker polling the Task Queue | Not tied to a framework.<br>Per-Activity retry and heartbeat policies, durable waits, and the Web UI.<br>Its costs are under [What it is not](#what-it-is-not) |
+| Temporal (this demo) | Event History of Signals and Activity inputs and results.<br>Workflow fields rebuilt by replay | Any Worker polling the Task Queue | Not tied to a framework.<br>Per-Activity retry and heartbeat policies, durable waits, and the Web UI.<br>Its costs are under [What this demo is not](#what-this-demo-is-not) |
 
 </details>
 
@@ -885,7 +887,9 @@ key, so Stripe makes one refund.
 
 </details>
 
-## What it is not
+<a id="what-it-is-not"></a>
+
+## What this demo is not
 
 - **Not a production refund service.** It leaves out authentication, a
   production database, a web application, multi-agent orchestration, and
@@ -995,8 +999,9 @@ and Temporal Cloud credits when available. -->
 
 ## Acknowledgments
 
-Thanks to Cecil, Johann, Tushar, Tom, Melissa, and Cornelia for the reviews
-that shaped how this repository frames memory and state.
+Thanks to Cecil, Johann, Tushar, Tom, Melissa, Cornelia, and Brian for the
+reviews that shaped how this repository frames memory and state, and to Duncan
+for the call to action.
 
 ## License
 
