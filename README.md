@@ -69,7 +69,7 @@ process. A new process can then pick up the work.
 
 - **Slides from the video:** [*Agentic Memory and State*, October 2026 (PDF)](docs/temporal-ai-agentic-memory-and-state-deck.pdf)
 - **Slides from the TAI meetup:** [*Agentic Memory and State*, in English and Japanese (PDF)](docs/agentic-memory-and-state-tai-meetup.pdf)
-- **Video:** [Watch the 13-minute walkthrough on YouTube](https://www.youtube.com/watch?v=cXKQkrgn-TE&utm_source=github&utm_medium=readme&utm_campaign=temporalaimemory&utm_content=top)
+- **Video:** [Watch the 13-minute walkthrough on YouTube](https://www.youtube.com/watch?v=cXKQkrgn-TE)
 
 **Last verified:** 2026-10-06 (offline demo, failure path, tests). Live model
 and Stripe test mode: 2026-10-02.
@@ -80,7 +80,7 @@ and Stripe test mode: 2026-10-02.
 
 - Python 3.11+
 - [uv](https://docs.astral.sh/uv/), tested on 0.11.8
-- the [Temporal CLI](https://docs.temporal.io/cli), tested on 1.6.2
+- the [Temporal CLI](https://docs.temporal.io/cli?utm_source=github&utm_medium=readme&utm_campaign=temporalaimemory), tested on 1.6.2
 
 **Keys:** none for the default run.
 
@@ -697,7 +697,7 @@ at the same point, before Stripe.
   $3 in, $0.30 cache read, $3.75 cache write, and $15 out.
 - Stripe test mode and the local dev server are free.
 
-**Temporal Cloud** ([Temporal pricing](https://temporal.io/pricing)). A pass is
+**Temporal Cloud** ([Temporal pricing](https://temporal.io/pricing?utm_source=github&utm_medium=readme&utm_campaign=temporalaimemory)). A pass is
 an estimated 20-165 billable Actions, which costs under one cent at $50 per
 million Actions. The count comes from the code, not a measurement: 1 start,
 8-10 Activity starts, 2-3 Signals, and 10-150 polled `stage_progress` Queries.
@@ -806,8 +806,8 @@ Each row is scoped to the linked pages as read on 2026-09-29.
 | Product | What it keeps | Who resumes after a crash | Compared with this demo |
 | --- | --- | --- | --- |
 | [LangGraph checkpointers](https://docs.langchain.com/oss/python/langgraph/checkpointers) | Graph state per `thread_id` at every super-step, including the next node.<br>The Store holds long-term memory across threads | Your code re-invokes the graph with the same `thread_id` | The closest open-source analogue.<br>With a durable checkpointer such as Postgres, a crash after the decision can resume at the next node.<br>A resumed node runs again from its start ([interrupts](https://docs.langchain.com/oss/python/langgraph/interrupts)), so effects need idempotency.<br>`InMemorySaver` loses its checkpoints on restart |
-| [LangSmith Deployment](https://docs.langchain.com/langsmith/agent-server) | Runs on a durable task queue, with checkpoints in Postgres | Another queue worker, from the latest checkpoint ([LangChain](https://www.langchain.com/blog/runtime-behind-production-deep-agents)) | For a LangGraph graph deployed there, this covers the crash-and-resume step shown here.<br>Temporal also runs without a framework and sets retry and heartbeat policy per Activity.<br>Temporal has a [LangGraph plugin](https://temporal.io/blog/temporal-langgraph-plugin-durable-execution) |
-| [OpenAI Agents SDK](https://openai.github.io/openai-agents-python/sessions/) | Session items.<br>A `RunState` saved at an [approval interruption](https://openai.github.io/openai-agents-python/human_in_the_loop/) | Your code restores the `RunState` and runs it again | A Session restores the answers.<br>Resuming at a chosen action needs a `RunState` you design, or [Temporal's integration](https://docs.temporal.io/develop/python/integrations/openai-agents) |
+| [LangSmith Deployment](https://docs.langchain.com/langsmith/agent-server) | Runs on a durable task queue, with checkpoints in Postgres | Another queue worker, from the latest checkpoint ([LangChain](https://www.langchain.com/blog/runtime-behind-production-deep-agents)) | For a LangGraph graph deployed there, this covers the crash-and-resume step shown here.<br>Temporal also runs without a framework and sets retry and heartbeat policy per Activity.<br>Temporal has a [LangGraph plugin](https://temporal.io/blog/temporal-langgraph-plugin-durable-execution?utm_source=github&utm_medium=readme&utm_campaign=temporalaimemory) |
+| [OpenAI Agents SDK](https://openai.github.io/openai-agents-python/sessions/) | Session items.<br>A `RunState` saved at an [approval interruption](https://openai.github.io/openai-agents-python/human_in_the_loop/) | Your code restores the `RunState` and runs it again | A Session restores the answers.<br>Resuming at a chosen action needs a `RunState` you design, or [Temporal's integration](https://docs.temporal.io/develop/python/integrations/openai-agents?utm_source=github&utm_medium=readme&utm_campaign=temporalaimemory) |
 | [Letta](https://docs.letta.com/guides/core-concepts/stateful-agents) | Stateful agents on the Letta server, with core, recall, and archival memory | A client reconnects to a [background run](https://docs.letta.com/v1-sdk/messages/long-running) by run and sequence ID | Keeps what the agent knows across client crashes.<br>A refund still needs its own idempotency key |
 | [Mem0](https://docs.mem0.ai/core-concepts/memory-types) | Memories an LLM extracts and reconciles, scoped by user, agent, or run | n/a (a memory layer) | Suits facts that carry across sessions, such as a customer's preferences.<br>Not an execution position.<br>Here it would sit beside the loop, called from an Activity |
 | [Google ADK Resume](https://adk.dev/runtime/resume/) | Session events, scoped state, a MemoryService, and a log of completed steps | The client re-invokes with the `invocation_id` | Draws nearly the same line between state and memory.<br>Tools may run again on resume |
@@ -855,7 +855,7 @@ allow 2 MB per payload and 50 MB per run. This demo stops at
 
 - **A claim check handles one big result.** Keep the data in your own store and
   put only a small key in Event History. Temporal's
-  [External Storage](https://docs.temporal.io/external-storage) does this for
+  [External Storage](https://docs.temporal.io/external-storage?utm_source=github&utm_medium=readme&utm_campaign=temporalaimemory) does this for
   payloads.
 - **Continue-As-New handles a long run.** It starts a fresh Event History with
   the same Workflow ID and a new Run ID. Temporal suggests it when the history
@@ -928,9 +928,9 @@ Temporal Web UI, where Workflow and Activity failures show, or see the
 
 ### Video
 
-<a id="videos"></a>[![Video thumbnail: the title "Temporal + AI: Agent Memory & State" beside Melanie Warrick on camera. Opens the video on YouTube.](https://i.ytimg.com/vi/cXKQkrgn-TE/maxresdefault.jpg)](https://www.youtube.com/watch?v=cXKQkrgn-TE&utm_source=github&utm_medium=readme&utm_campaign=temporalaimemory&utm_content=video-section)
+<a id="videos"></a>[![Video thumbnail: the title "Temporal + AI: Agent Memory & State" beside Melanie Warrick on camera. Opens the video on YouTube.](https://i.ytimg.com/vi/cXKQkrgn-TE/maxresdefault.jpg)](https://www.youtube.com/watch?v=cXKQkrgn-TE)
 
-**[Temporal & AI Series: Agent Memory & State](https://www.youtube.com/watch?v=cXKQkrgn-TE&utm_source=github&utm_medium=readme&utm_campaign=temporalaimemory&utm_content=video-section)**
+**[Temporal & AI Series: Agent Memory & State](https://www.youtube.com/watch?v=cXKQkrgn-TE)**
 
 The video ran
 `uv run refund-demo stage --real --real-model --model-provider openai` with an
@@ -981,10 +981,10 @@ The September 2026 talk ran the code tagged
 
 <a id="resources"></a>
 
-- [Temporal docs](https://docs.temporal.io) and the
+- [Temporal docs](https://docs.temporal.io?utm_source=github&utm_medium=readme&utm_campaign=temporalaimemory) and the
   [Python SDK](https://github.com/temporalio/sdk-python)
-- [Continue-As-New](https://docs.temporal.io/workflow-execution/continue-as-new)
-  and [External Storage](https://docs.temporal.io/external-storage)
+- [Continue-As-New](https://docs.temporal.io/workflow-execution/continue-as-new?utm_source=github&utm_medium=readme&utm_campaign=temporalaimemory)
+  and [External Storage](https://docs.temporal.io/external-storage?utm_source=github&utm_medium=readme&utm_campaign=temporalaimemory)
 - [Stripe idempotent requests](https://docs.stripe.com/api/idempotent_requests)
 - **For your coding agent:** the
   [Temporal developer skill](https://github.com/temporalio/skill-temporal-developer),
