@@ -69,7 +69,7 @@ process. A new process can then pick up the work.
 
 - **Slides from the video:** [*Agentic Memory and State*, October 2026 (PDF)](docs/temporal-ai-agentic-memory-and-state-deck.pdf)
 - **Slides from the TAI meetup:** [*Agentic Memory and State*, in English and Japanese (PDF)](docs/agentic-memory-and-state-tai-meetup.pdf)
-- **Video:** [Watch the 13-minute walkthrough on YouTube](https://www.youtube.com/watch?v=cXKQkrgn-TE)
+- **Video:** [Watch the 13-minute walkthrough on YouTube](https://www.youtube.com/watch?v=cXKQkrgn-TE&utm_source=github&utm_medium=readme&utm_campaign=temporalaimemory&utm_content=top)
 
 **Last verified:** 2026-10-06 (offline demo, failure path, tests). Live model
 and Stripe test mode: 2026-10-02.
@@ -928,9 +928,9 @@ Temporal Web UI, where Workflow and Activity failures show, or see the
 
 ### Video
 
-<a id="videos"></a>[![Video thumbnail: the title "Temporal + AI: Agent Memory & State" beside Melanie Warrick on camera. Opens the video on YouTube.](https://i.ytimg.com/vi/cXKQkrgn-TE/maxresdefault.jpg)](https://www.youtube.com/watch?v=cXKQkrgn-TE)
+<a id="videos"></a>[![Video thumbnail: the title "Temporal + AI: Agent Memory & State" beside Melanie Warrick on camera. Opens the video on YouTube.](https://i.ytimg.com/vi/cXKQkrgn-TE/maxresdefault.jpg)](https://www.youtube.com/watch?v=cXKQkrgn-TE&utm_source=github&utm_medium=readme&utm_campaign=temporalaimemory&utm_content=video-section)
 
-**[Temporal & AI Series: Agent Memory & State](https://www.youtube.com/watch?v=cXKQkrgn-TE)**
+**[Temporal & AI Series: Agent Memory & State](https://www.youtube.com/watch?v=cXKQkrgn-TE&utm_source=github&utm_medium=readme&utm_campaign=temporalaimemory&utm_content=video-section)**
 
 The video ran
 `uv run refund-demo stage --real --real-model --model-provider openai` with an
@@ -990,8 +990,8 @@ The September 2026 talk ran the code tagged
   [Temporal developer skill](https://github.com/temporalio/skill-temporal-developer),
   installed with `npx skills add temporalio/skill-temporal-developer`
 
-<!-- TODO before publishing: UTM tags on the video links, the Temporal & AI
-Series playlist URL (in Where to go next), related videos
+<!-- TODO before publishing: the Temporal & AI Series playlist URL (in Where
+to go next), related videos
 (human-in-the-loop, multi-agent handoffs), the blog post URL if there is one,
 and Temporal Cloud credits when available. -->
 
