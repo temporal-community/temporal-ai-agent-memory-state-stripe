@@ -676,7 +676,8 @@ model and whether it touches Stripe are separate choices:
 - `refund-demo start` calls the live model whenever a model key is set, even
   with `--dry-run`. Without a model key, it uses the deterministic policy and
   makes no model calls.
-- The stage uses a model only with `--real-model`.
+- The stage uses a model by default when the keys are set (it asks for
+  missing ones), with `--real-model`, and never with `--offline`.
 - `AGENT_MODEL_PROVIDER` selects `anthropic` or `openai`, and the CLI option
   `--model-provider` records that choice in the Workflow input.
 - For the refund, `--dry-run` writes to an offline Stripe-like ledger under

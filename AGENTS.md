@@ -243,8 +243,9 @@ longest line at those widths, not only at 128, the width
     Temporal. It owns Event History growth, its limits, the claim check, and
     Continue-As-New.
 - These wording rules apply to every doc:
-  - Temporal is not a memory store. It records execution state in Event
-    History, so say Temporal “records,” never “remembers.”
+  - Temporal records this run's working memory (Activity inputs and results)
+    in Event History, so say Temporal “records,” never “remembers.” Long-term
+    memory lives in a store you own, here the SQLite demo store.
   - Stripe, or the offline ledger, owns whether the refund happened. Never say
     Temporal tracks the refund's state.
   - Give cost in tokens and dollars together, and never make “$0” a headline.

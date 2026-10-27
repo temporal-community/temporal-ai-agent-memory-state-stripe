@@ -11,6 +11,12 @@
 
 </div>
 
+> [!NOTE]
+> This is a teaching demo. It simulates a customer-support agent handling a
+> refund, with sample data in a small SQLite store, two scripted customer
+> questions, and Stripe test mode or an offline ledger. It shows the pattern
+> for keeping an agent's work durable, not a complete production setup.
+
 As agents run longer and take on more complex work, how they handle memory and
 state starts to matter. An agent that loses its place partway through a task
 can leave a customer repeating themselves, or leave a job half done. Managing
@@ -226,9 +232,16 @@ hooks so you can watch recovery happen at a predictable moment.
 - **A real crash.** Each stop is a real SIGKILL, with no clean shutdown.
 - **Answers carried over.** Demo 1's answers go into Demo 2 as Signals, so you
   don't type them twice. Demo 1's new agent process never gets them.
-- **Stand-ins.** By default, a fixed policy stands in for the model, so the run
-  makes no model calls (0 tokens, $0), and an offline ledger stands in for
-  Stripe. Pass `--real-model` for a live model or `--real` for Stripe test
+- **Two scripted questions.** The agent always asks the same two questions
+  first (was the package opened, and what was damaged), even with a live
+  model, so every run reaches the crash at the same point. After that, the
+  model chooses its own lookups and decision.
+- **Sample data.** The lookups read a small SQLite store
+  ([store.py](src/refund_agent/store.py)) seeded with one order and one
+  customer. A real app reads its own systems.
+- **Offline stand-ins.** With `--offline`, a fixed policy stands in for the
+  model, so the run makes no model calls (0 tokens, $0), and an offline ledger
+  stands in for Stripe. The default run uses a live model and Stripe test
   mode.
 - **Failure drills.** Two optional runs stop the Worker in the middle of the
   refund Activity:
@@ -324,7 +337,10 @@ them:
 - **Execution state** is where the work stands, and Temporal records it. After
   the crash, a new Worker replays Event History and runs only the refund.
 - **Effect state** is whether the refund actually happened, and Stripe owns it.
-  Every retry sends the same idempotency key, so Stripe makes one refund.
+  Every retry sends the same idempotency key, so Stripe makes one refund. In
+  Temporal's terms, Stripe is the source of truth for the effect, the
+  `issue_refund` Activity result is the Workflow's record of it, and the
+  idempotency key reconciles the two when a crash lands in between.
 
 Memory helps the reasoning continue, and Temporal helps the operation continue.
 
@@ -336,7 +352,7 @@ table shows what each one is in this demo and where to find it.
 | | What it helps with | In this demo | Where to find it |
 | --- | --- | --- | --- |
 | **Context** (working memory) | What the model sees for this one decision.<br>The loop sends it again on every turn | The customer's refund request, their two answers, and what the agent has looked up so far: order 1234 and the refund history of the demo customer, Nyghtowl | `working_memory`.<br>Demo 1: a list in the agent process (`naive_refund.py`).<br>Demo 2: a Workflow field (`workflow.py`) that replay rebuilds.<br>In Event History: the input of each `agent_decide_next_step` Activity |
-| **Long-term memory** (a memory store) | What the agent carries across runs:<br>Episodic: past cases.<br>Semantic: facts it looks up.<br>Procedural: how-to, such as skill files and tool definitions | None, on purpose. The demo saves nothing between runs.<br>Lookups are labeled `(memory)` on screen because they stand in for a memory store, but they read sample data, and each result becomes part of context once the agent looks it up | Your store: a vector store, a knowledge base, or memory files |
+| **Long-term memory** (a memory store) | What the agent carries across runs:<br>Episodic: past cases.<br>Semantic: facts it looks up.<br>Procedural: how-to, such as skill files and tool definitions | A light version. After the refund, `remember_case` saves a short case note to the demo's SQLite store, and `lookup_customer_history` reads notes back as `past_cases` on later runs.<br>Each guided run starts from fresh data, so the demo plays the same way every time. Each lookup result becomes part of context once the agent reads it | Your store: a vector store, a knowledge base, or memory files.<br>Here: `store.sqlite` in the run's state folder |
 | **Execution state** | Where the work stands: which steps finished and what runs next, so the work can continue after a crash without redoing it | The progress Temporal recorded before the crash: the customer answered two questions, the agent finished two lookups (three when a live model also checks the refund policy), and its next step is to issue the refund | Temporal: the Workflow's Event History in the Temporal Web UI, or `uv run refund-demo inspect <workflow-id>` |
 | **Effect state** | Whether the side effect really happened | Whether Stripe actually refunded the payment | Stripe: the Dashboard in test mode. The refund's metadata carries `temporal_workflow_id` and `temporal_idempotency_key`.<br>Offline: the ledger |
 
@@ -367,17 +383,26 @@ For any fact, ask whether another system already owns it. Asked of every fact,
 that question finds more kinds of state than the four in this table, such as
 token budgets, locks, and quotas.
 
-**Temporal is not a memory store.** It records execution state, such as one
-run's Signals and its Activity inputs and results, in Event History, which
-lives in the Temporal Service rather than in the Worker. That's enough to
-rebuild this run's working memory by replay, but it isn't a place to keep what
-the agent knows from one run to the next.
+<a id="temporal-is-not-a-memory-store"></a>**What Temporal keeps, and what needs a memory store.**
+Temporal records every Activity's inputs and results, and every Signal, in
+Event History, which lives in the Temporal Service rather than in the Worker.
+For this agent, that includes each model call's input (the request and working
+memory) and its output (the next step, and the written rationale when it
+decides), plus the customer's answers. So replay rebuilds this run's working
+memory after a crash, with no code to save it. The model's internal reasoning
+isn't returned by the provider, so it isn't recorded anywhere.
 
-- Long-term memory belongs in a store you own.
-- Event History has size limits, described under [Gotchas](#gotchas).
-- Temporal can run the store's reads and writes as Activities, so each one is
+What Temporal doesn't do is carry knowledge from one run to the next:
+
+- Long-term memory belongs in a store you own. In this demo, `remember_case`
+  writes a case note to the SQLite store, and `lookup_customer_history` reads
+  it back.
+- Temporal runs the store's reads and writes as Activities, so each one is
   recorded and retried like any other step.
-- How best to combine the two is still an open design question.
+- Memory products such as mem0 and Amazon Bedrock AgentCore Memory decide what
+  to keep, when to write it, and what to bring back into context. They plug in
+  the same way, through Activities.
+- Event History has size limits, described under [Gotchas](#gotchas).
 
 <details>
 <summary>More on memory, state, and authority</summary>
@@ -872,6 +897,9 @@ allow 2 MB per payload and 50 MB per run. This demo stops at
   only before the refund, because the idempotency key uses the Run ID. A
   refund attempted in a new run would carry a different key, and Stripe
   couldn't tell it was a retry.
+
+This demo describes both patterns but doesn't implement them. More examples
+that do are coming.
 
 </details>
 
