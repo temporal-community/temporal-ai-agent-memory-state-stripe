@@ -1,6 +1,6 @@
 """Small serializable values that cross Temporal history boundaries."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass(frozen=True)
@@ -82,6 +82,9 @@ class CustomerHistory:
     account_tenure_days: int
     purchases: list[str]
     prior_refunds: list[str]
+    # LONG-TERM MEMORY: notes earlier runs saved with remember_case, newest
+    # first. Empty at the start of every stage run.
+    past_cases: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -102,6 +105,8 @@ class AgentStep:
 
     action: str  # ask_customer | use_tool | decide
     tool: str | None = None
+    # The lookup tools take no arguments (the Workflow binds the IDs), so this
+    # is empty for them. Older recorded histories may still carry IDs here.
     tool_args: dict[str, str] | None = None
     question_id: str | None = None
     question: str | None = None

@@ -15,6 +15,7 @@ from refund_agent.activities import (
     issue_refund,
     lookup_customer_history,
     lookup_order,
+    remember_case,
     show_empty_agent_view,
 )
 from refund_agent.settings import (
@@ -70,6 +71,7 @@ async def run_worker() -> None:
                     lookup_customer_history,
                     check_refund_policy,
                     issue_refund,
+                    remember_case,
                 ],
                 activity_executor=executor,
             )

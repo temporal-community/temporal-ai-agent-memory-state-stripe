@@ -153,7 +153,7 @@ def _naive_request(args: argparse.Namespace) -> RefundRequest:
 
 
 def _lookup(tool: str | None, request: RefundRequest) -> dict:
-    # The same fixtures and dispatch as RefundWorkflow._run_tool, run in this
+    # The same store and dispatch as RefundWorkflow._run_tool, run in this
     # process: no Activity, so nothing is recorded outside it.
     if tool == TOOL_ORDER:
         return asdict(lookup_order(request.order_id))
@@ -237,6 +237,7 @@ def _run_interactive_agent_loop(request: RefundRequest) -> AgentStep:
             working_memory.append(
                 {
                     "tool": "customer_answer",
+                    "question": question,
                     "result": {
                         "question_id": question_id,
                         "answer": answers[question_id],

@@ -73,8 +73,8 @@ process. A new process can then pick up the work.
 - **Slides from the TAI meetup:** [*Agentic Memory and State*, in English and Japanese (PDF)](docs/agentic-memory-and-state-tai-meetup.pdf)
 - **Video:** [Watch the 13-minute walkthrough on YouTube](https://www.youtube.com/watch?v=cXKQkrgn-TE)
 
-**Last verified:** 2026-10-06 (offline demo, failure path, tests). Live model
-and Stripe test mode: 2026-10-02.
+**Last verified:** 2026-10-26 (live model and Stripe test mode, offline demo,
+tests). Failure path: 2026-10-06.
 
 ## Run it
 
@@ -84,7 +84,10 @@ and Stripe test mode: 2026-10-02.
 - [uv](https://docs.astral.sh/uv/), tested on 0.11.8
 - the [Temporal CLI](https://docs.temporal.io/cli?utm_source=github&utm_medium=readme&utm_campaign=temporalaimemory), tested on 1.6.2
 
-**Keys:** none for the default run.
+**Keys:** the default run is live, so it uses a model key (OpenAI or
+Anthropic) and a Stripe test key from `.env`. If one is missing, the demo asks
+for it for that run only, or you press Enter to run offline. Add `--offline`
+(or run `make run-offline`) to skip the keys entirely.
 
 ```bash
 git clone https://github.com/temporal-community/temporal-ai-agent-memory-state-stripe.git
@@ -121,9 +124,10 @@ without running it.
 | Target | Runs | Notes |
 | --- | --- | --- |
 | `make setup` | `uv sync --extra dev --extra tui` | Installs both extras. A `uv sync` without them removes the Rich terminal view. |
-| `make run` | `uv run refund-demo stage` | Runs the key-free path with the fixed policy and the offline ledger. It makes no model calls: 0 tokens, $0. |
-| `make run-real` | `uv run refund-demo stage --real` | Needs a Stripe test key, and creates Stripe test objects. |
-| `make failure` | `uv run refund-demo stage --simulate-stripe-timeout` | Runs offline and kills the Worker while `issue_refund` is in flight. A new Worker runs attempt 2 with the same idempotency key. For Stripe test mode, run the command with `--real`. |
+| `make run` | `uv run refund-demo stage` | The live run: a model and Stripe test mode. It asks for any missing key, or runs offline if you press Enter. See [Cost to run](#cost-to-run). |
+| `make run-offline` | `uv run refund-demo stage --offline` | Runs the key-free path with the fixed policy and the offline ledger. It makes no model calls: 0 tokens, $0. |
+| `make run-real` | `uv run refund-demo stage --real` | Stripe test mode with the fixed policy instead of a model. Needs a Stripe test key, and creates Stripe test objects. |
+| `make failure` | `uv run refund-demo stage --offline --simulate-stripe-timeout` | Runs offline and kills the Worker while `issue_refund` is in flight. A new Worker runs attempt 2 with the same idempotency key. For Stripe test mode, run the command with `--real`. |
 | `make reset` | `uv run refund-demo cleanup`, then prints the manual steps | Refunds only leftover demo test payments, and only with a Stripe test key. It deletes and stops nothing, and default runs need no reset. For everything else, see [reset between runs](docs/GUIDE.md#reset-between-takes). |
 | `make test` | `uv run --extra dev pytest -q` | Runs offline. A passing run ends with `N passed` and exit code 0. |
 | `make lint` | `uv run --extra dev ruff check .` and `uv run --extra dev ruff format --check .` | Runs offline. A passing run prints `All checks passed!` and `N files already formatted`. |
@@ -132,8 +136,11 @@ without running it.
 
 ### Keys and live paths
 
-<a id="choose-the-stage-path"></a>The default run needs no keys. Two flags swap
-a stand-in for a live service, and you can use either one or both.
+<a id="choose-the-stage-path"></a>The default run is live: it turns on both
+flags below when the keys are set, and asks for any that are missing. When no
+one is at the terminal to answer, as in tests and CI, it runs offline.
+`--offline` always runs offline. To pick one live service, pass a flag
+yourself:
 
 - **`--real`** swaps the offline ledger for Stripe test mode. It needs a
   `STRIPE_API_KEY` that starts with `sk_test_` or `rk_test_`; the demo rejects
@@ -150,9 +157,9 @@ a stand-in for a live service, and you can use either one or both.
     `claude-sonnet-4-6`. Some newer Claude models
     [reject this code's tool choice](docs/GUIDE.md#troubleshooting). The Claude
     figures in [Cost to run](#cost-to-run) are estimates, not measurements.
-  - If both model keys are set and you don't choose a provider, the demo stops
-    with an error that asks you to choose one. Pass `--model-provider`, or set
-    `AGENT_MODEL_PROVIDER`.
+  - If both model keys are set and you don't choose a provider, the default
+    run uses OpenAI, and `--real-model` stops with an error that asks you to
+    choose one. Pass `--model-provider`, or set `AGENT_MODEL_PROVIDER`.
   - [Cost to run](#cost-to-run) has the tokens and dollars, and the guide
     covers [live models](docs/GUIDE.md#live-models) in more depth.
 
@@ -167,7 +174,7 @@ for example from a coding agent, pipe in Enter presses. The run then accepts
 every default and exits 0:
 
 ```bash
-yes '' | uv run refund-demo stage
+yes '' | uv run refund-demo stage --offline
 ```
 
 </details>
@@ -643,23 +650,23 @@ again; only a call that was in flight at the crash can run twice.
 
 The measured runs show the difference between the two demos:
 
-- Before the kill, each demo's pass made 4 model calls: 2,962 tokens and
-  $0.0009 in Demo 1, and 2,946 tokens and $0.0009 in Demo 2.
+- Before the kill, each demo's pass made 4 model calls: 3,006 tokens and
+  $0.0009 in Demo 1, and 2,991 tokens and $0.0009 in Demo 2.
 - After the kill, Demo 1's customer has to start over, which costs 4 more
   calls: 2,972 tokens and $0.0009 more.
 - After the kill, Demo 2's replay made 0 calls, so it cost 0 tokens and $0.
 
-These figures come from `--real-model` on GPT-5.6 Luna, measured on 2026-10-02
-at list prices as of 2026-09-29. Without `--real-model`, the demo uses a fixed
-policy and makes no model calls, so it costs 0 tokens and $0. `--real` alone
-also makes no model calls.
+These figures come from a live run on GPT-5.6 Luna, measured on 2026-10-26
+(the start-over on 2026-10-02) at list prices as of 2026-09-29. Offline, the
+demo uses a fixed policy and makes no model calls, so it costs 0 tokens and $0.
+`--real` alone also makes no model calls.
 
 | Run | Calls | Tokens | Dollars | Basis |
 | --- | --- | --- | --- | --- |
-| Demo 1 pass, `gpt-5.6-luna` | 4 | 2,962<br>In: 2,619, 0 cached<br>Out: 343, 87 reasoning | $0.0009 | **Measured**, 2026-10-02 |
+| Demo 1 pass, `gpt-5.6-luna` | 4 | 3,006<br>In: 2,713, 0 cached<br>Out: 293, 78 reasoning | $0.0009 | **Measured**, 2026-10-26 |
 | Demo 1 start-over, as the customer must | 4 more | 2,972<br>In: 2,623<br>Out: 349, 97 reasoning | $0.0009 more | **Measured**, 2026-10-02 |
-| Demo 2 pass, before the kill | 4 | 2,946<br>In: 2,611<br>Out: 335, 84 reasoning | $0.0009 | **Measured**, 2026-10-02 |
-| Demo 2 replay after the kill | 0 | 0 | $0.00 | **Measured**, 2026-10-02 |
+| Demo 2 pass, before the kill | 4 | 2,991<br>In: 2,709<br>Out: 282, 75 reasoning | $0.0009 | **Measured**, 2026-10-26 |
+| Demo 2 replay after the kill | 0 | 0 | $0.00 | **Measured**, 2026-10-26 |
 | Each demo, or a Demo 1 start-over, on `claude-sonnet-4-6` | about 4 | about 5,600-7,300<br>In: 5,400-6,900<br>Out: 200-400 | about $0.02-$0.03 | **Estimated**, 2026-09-29<br>Not run |
 
 <!-- After a measured Claude pass, replace the Claude estimate with the
@@ -938,8 +945,8 @@ Temporal Web UI, where Workflow and Activity failures show, or see the
 
 The video ran
 `uv run refund-demo stage --real --real-model --model-provider openai` with an
-OpenAI key and a Stripe test key. Without keys, `make run` tells the same story
-offline.
+OpenAI key and a Stripe test key, which is now what `make run` does. Without
+keys, `make run-offline` tells the same story offline.
 
 <details>
 <summary>Chapters</summary>

@@ -34,11 +34,18 @@ from refund_agent.models import (
 from refund_agent.workflow import RefundWorkflow, refund_activity_timeouts
 
 
+@pytest.fixture(autouse=True)
+def _demo_store_in_tmp(tmp_path, monkeypatch) -> None:
+    # The lookup tools read the SQLite demo store in DEMO_STATE_DIR. Each test
+    # gets a fresh one, so nothing is written under .demo-state.
+    monkeypatch.setenv("DEMO_STATE_DIR", str(tmp_path))
+
+
 def _request(amount_cents: int) -> RefundRequest:
     return RefundRequest(
         request_id="r",
-        order_id="o1",
-        customer_id="c1",
+        order_id="order-1234",
+        customer_id="cus_demo_42",
         payment_intent_id="pi",
         amount_cents=amount_cents,
         reason="x",
@@ -905,6 +912,10 @@ async def _check_refund_phases(temporal: str) -> None:
     async def policy(order_id: str) -> ReturnStatus:
         return ReturnStatus(order_id, True, False, False, False, "eligible")
 
+    @activity.defn(name="remember_case")
+    async def remember(customer_id: str, case_id: str, note: str) -> bool:
+        return True
+
     @activity.defn(name="issue_refund")
     async def refund(
         request: RefundRequest,
@@ -929,7 +940,7 @@ async def _check_refund_phases(temporal: str) -> None:
             env.client,
             task_queue=queue,
             workflows=[RefundWorkflow],
-            activities=[decide, order, history, policy, refund],
+            activities=[decide, order, history, policy, refund, remember],
         ):
             held = await env.client.start_workflow(
                 RefundWorkflow.run,
@@ -997,6 +1008,7 @@ async def _check_refund_phases(temporal: str) -> None:
                 "lookup_customer_history": "Look up the customer's refund history",
                 "check_refund_policy": "Check the refund policy",
                 "issue_refund": "Issue the refund in Stripe",
+                "remember_case": "Save a case note to long-term memory",
             }
 
 
@@ -1007,3 +1019,45 @@ def test_stage_progress_reports_completed_after_the_refund() -> None:
     if temporal is None:
         pytest.skip("needs the temporal CLI on PATH")
     asyncio.run(_check_refund_phases(temporal))
+
+
+def test_lookups_read_the_demo_store() -> None:
+    order = lookup_order("order-1234")
+    assert (order.item, order.amount_cents, order.status) == (
+        "python plushy",
+        8000,
+        "delivered",
+    )
+    history = lookup_customer_history("cus_demo_42")
+    assert history.account_tenure_days == 824
+    assert len(history.prior_refunds) == 1
+    assert history.past_cases == []
+    assert check_refund_policy("order-1234").return_required is False
+
+
+def test_lookup_of_an_unknown_order_fails_without_retrying() -> None:
+    with pytest.raises(ApplicationError) as error:
+        lookup_order("order-9999")
+    assert error.value.non_retryable
+
+
+def test_case_notes_are_saved_once_and_read_back_as_past_cases() -> None:
+    from refund_agent.activities import remember_case
+
+    assert remember_case("cus_demo_42", "wf-1", "refund succeeded") is True
+    # A retried write with the same case ID saves nothing new.
+    assert remember_case("cus_demo_42", "wf-1", "refund succeeded") is False
+    assert remember_case("cus_demo_42", "wf-2", "second case") is True
+    history = lookup_customer_history("cus_demo_42")
+    assert history.past_cases == ["second case", "refund succeeded"]
+    # Notes are memory, not refunds: the prior-refund count is unchanged.
+    assert len(history.prior_refunds) == 1
+
+
+def test_lookup_tools_take_no_ids_from_the_model() -> None:
+    from refund_agent.activities.model import _TOOL_SCHEMAS
+
+    lookups = {TOOL_ORDER, TOOL_HISTORY, TOOL_POLICY}
+    for schema in _TOOL_SCHEMAS:
+        if schema["name"] in lookups:
+            assert schema["parameters"]["properties"] == {}

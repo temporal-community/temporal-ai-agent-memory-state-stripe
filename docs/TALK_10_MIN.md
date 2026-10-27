@@ -251,10 +251,10 @@ Talk from the quick hits on each slide.
 - **Lead with why:** starting over repeats every model call and pays for each
   one again. Replay returns recorded results, so it doesn't pay again for
   finished calls. Only a call in flight at the crash can run twice.
-- **Say the date and model:** "Measured October 2, on GPT-5.6 Luna."
-- **Demo 1:** one pass made 4 model calls, 2,962 tokens, $0.0009. Starting
-  over made 4 more calls, 2,972 tokens, and $0.0009 more.
-- **Demo 2:** the pass before the kill made 4 model calls, 2,946 tokens,
+- **Say the date and model:** "Measured October 26, on GPT-5.6 Luna."
+- **Demo 1:** one pass made 4 model calls, 3,006 tokens, $0.0009. Starting
+  over made 4 more calls, 2,972 tokens, and $0.0009 more (October 2).
+- **Demo 2:** the pass before the kill made 4 model calls, 2,991 tokens,
   $0.0009. Replay after the kill added 0 model calls, so no more tokens or
   dollars.
 - **At scale:** 1M requests a month comes to about 3B tokens and about $900.

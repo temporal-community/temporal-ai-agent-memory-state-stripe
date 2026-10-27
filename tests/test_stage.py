@@ -902,3 +902,109 @@ def test_stage_stops_when_the_model_denies_demo_one() -> None:
                 _FakeConsole(), process, request_text="refund", amount_cents=8000
             )
         )
+
+
+def _stage_args(*extra: str) -> argparse.Namespace:
+    return _parser().parse_args(["stage", *extra])
+
+
+_LIVE_KEYS = {
+    "OPENAI_API_KEY": "sk-openai",
+    "OPENAI_MODEL": "test-model",
+    "STRIPE_API_KEY": "sk_test_123",
+}
+
+
+@pytest.fixture
+def _no_live_keys(monkeypatch) -> None:
+    for name in (
+        "OPENAI_API_KEY",
+        "OPENAI_MODEL",
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_MODEL",
+        "AGENT_MODEL_PROVIDER",
+        "STRIPE_API_KEY",
+    ):
+        # setenv first, so monkeypatch restores the original value (or absence)
+        # even when choose_stage_mode sets the variable during the test.
+        monkeypatch.setenv(name, "")
+        monkeypatch.delenv(name)
+
+
+def _no_prompt(prompt: str) -> str:
+    raise AssertionError(f"unexpected prompt: {prompt}")
+
+
+def test_stage_runs_live_by_default_when_keys_are_set(
+    _no_live_keys, monkeypatch
+) -> None:
+    from refund_agent.cli import choose_stage_mode
+
+    for name, value in _LIVE_KEYS.items():
+        monkeypatch.setenv(name, value)
+    mode = choose_stage_mode(
+        _stage_args(), interactive=True, ask=_no_prompt, ask_secret=_no_prompt
+    )
+    assert mode == (True, True, "openai")
+
+
+def test_stage_offline_flag_skips_keys_and_prompts(_no_live_keys) -> None:
+    from refund_agent.cli import choose_stage_mode
+
+    mode = choose_stage_mode(
+        _stage_args("--offline"),
+        interactive=True,
+        ask=_no_prompt,
+        ask_secret=_no_prompt,
+    )
+    assert mode == (False, False, None)
+
+
+def test_stage_without_a_terminal_runs_offline_when_keys_are_missing(
+    _no_live_keys,
+) -> None:
+    from refund_agent.cli import choose_stage_mode
+
+    mode = choose_stage_mode(
+        _stage_args(), interactive=False, ask=_no_prompt, ask_secret=_no_prompt
+    )
+    assert mode == (False, False, None)
+
+
+def test_stage_enter_at_the_key_prompt_runs_offline(_no_live_keys) -> None:
+    from refund_agent.cli import choose_stage_mode
+
+    mode = choose_stage_mode(
+        _stage_args(), interactive=True, ask=lambda _: "", ask_secret=lambda _: ""
+    )
+    assert mode == (False, False, None)
+
+
+def test_stage_keys_entered_at_the_prompt_are_used_for_this_run(
+    _no_live_keys,
+) -> None:
+    from refund_agent.cli import choose_stage_mode
+
+    secrets = iter(["sk-openai", "sk_test_123"])
+    mode = choose_stage_mode(
+        _stage_args(),
+        interactive=True,
+        ask=lambda _: "test-model",
+        ask_secret=lambda _: next(secrets),
+    )
+    assert mode == (True, True, "openai")
+    assert os.environ["OPENAI_MODEL"] == "test-model"
+    assert os.environ["STRIPE_API_KEY"] == "sk_test_123"
+
+
+def test_stage_rejects_a_live_stripe_key_at_the_prompt(_no_live_keys) -> None:
+    from refund_agent.cli import choose_stage_mode
+
+    secrets = iter(["sk-openai", "sk_live_123"])
+    mode = choose_stage_mode(
+        _stage_args(),
+        interactive=True,
+        ask=lambda _: "test-model",
+        ask_secret=lambda _: next(secrets),
+    )
+    assert mode == (False, False, None)

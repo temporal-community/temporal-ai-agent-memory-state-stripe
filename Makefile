@@ -1,22 +1,25 @@
 # Shortcuts for the commands in README.md. Each recipe is the raw command the
 # README shows beside it; `make -n <target>` prints it without running it.
 
-.PHONY: help setup run run-real failure reset test lint typecheck usage
+.PHONY: help setup run run-offline run-real failure reset test lint typecheck usage
 
 help: ## List the targets
-	@awk 'BEGIN {FS = ":.*## "} /^[a-z-]+:.*## / {printf "  make %-9s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
+	@awk 'BEGIN {FS = ":.*## "} /^[a-z-]+:.*## / {printf "  make %-11s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
 
 setup: ## Install the project with the dev and tui extras
 	uv sync --extra dev --extra tui
 
-run: ## Offline stage run: no keys, no model calls
+run: ## Live stage run: a model and Stripe test mode (asks for missing keys)
 	uv run refund-demo stage
 
-run-real: ## Stage run against Stripe test mode (needs a test key)
+run-offline: ## Offline stage run: no keys, no model calls
+	uv run refund-demo stage --offline
+
+run-real: ## Stripe test mode with the fixed policy instead of a model
 	uv run refund-demo stage --real
 
-failure: ## Kill the Worker while the refund Activity is in flight
-	uv run refund-demo stage --simulate-stripe-timeout
+failure: ## Kill the Worker while the refund Activity is in flight (offline)
+	uv run refund-demo stage --offline --simulate-stripe-timeout
 
 reset: ## Refund leftover Stripe test charges; print the manual steps
 	@echo "Stripe test mode cleanup. Offline, a missing STRIPE_API_KEY is expected."

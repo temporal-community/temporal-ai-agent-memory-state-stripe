@@ -21,6 +21,7 @@ with workflow.unsafe.imports_passed_through():
         issue_refund,
         lookup_customer_history,
         lookup_order,
+        remember_case,
     )
     from refund_agent.models import (
         CustomerHistory,
@@ -111,6 +112,7 @@ class RefundWorkflow:
                 break
             if step.action == "ask_customer":
                 question_id = step.question_id or ""
+                question_text = step.question or question_id
                 if question_id not in {"item_opened", "damage"}:
                     raise ApplicationError(
                         f"agent asked an unsupported question: {question_id}",
@@ -119,7 +121,7 @@ class RefundWorkflow:
                     )
                 self.pending_question = {
                     "question_id": question_id,
-                    "question": step.question or question_id,
+                    "question": question_text,
                     "suggested_answer": step.suggested_answer or "",
                 }
                 self.stage_phase_value = "waiting_for_answer"
@@ -134,9 +136,12 @@ class RefundWorkflow:
 
                 await workflow.wait_condition(answered)
                 answer = self.customer_answers[question_id]
+                # The agent's question goes in with the answer, so the next
+                # turn sees what it asked as well as what it heard.
                 self.working_memory.append(
                     {
                         "tool": "customer_answer",
+                        "question": question_text,
                         "result": {"question_id": question_id, "answer": answer},
                     }
                 )
@@ -230,6 +235,24 @@ class RefundWorkflow:
             summary="Issue the refund in Stripe",
         )
 
+        # LONG-TERM MEMORY: save a short case note in the demo store, so later
+        # runs for this customer can read it back. The Workflow ID makes the
+        # write idempotent. workflow.patched keeps Workflows that started before
+        # this step existed replaying without it (see "Changing the Workflow
+        # safely" in AGENTS.md).
+        if workflow.patched("remember-case"):
+            note = (
+                f"{workflow.now().date().isoformat()}: refund {result.status} for "
+                f"{request.order_id}, ${request.amount_cents / 100:.2f}. "
+                f"{decision.rationale}"
+            ).strip()
+            await workflow.execute_activity(
+                remember_case,
+                args=[request.customer_id, workflow.info().workflow_id, note],
+                start_to_close_timeout=timedelta(seconds=10),
+                summary="Save a case note to long-term memory",
+            )
+
         if request.hold_after_effect:
             # Demo-only wait for the manual walkthrough (refund-demo start --hold,
             # then refund-demo release). A real Workflow returns the result here.
@@ -247,8 +270,9 @@ class RefundWorkflow:
         return result
 
     async def _run_tool(self, tool: str | None, request: RefundRequest) -> dict:
-        # Dispatch is deterministic: the tool name came from a recorded result,
-        # and the arguments come from the request, not from the model.
+        # The model picks the tool; the IDs come from this run's request. The
+        # tool schemas take no IDs, so the model can't point a lookup at another
+        # customer's records: a common pattern for binding tools to the session.
         # Each summary names the step in plain words in Event History.
         result: OrderDetails | CustomerHistory | ReturnStatus
         if tool == "lookup_order":
