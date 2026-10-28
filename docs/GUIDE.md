@@ -30,23 +30,27 @@ If you're presenting the demo, the timed notes for a 10-minute talk are in
 the stage.
 
 ```bash
-uv run refund-demo stage      # or: make run
+uv run refund-demo stage             # or: make run
+uv run refund-demo stage --offline   # or: make run-offline
 ```
 
-Press Enter at each prompt to move to the next step. By default, the stage
-uses a deterministic policy in place of a model and an offline Stripe-like
-ledger in place of Stripe. If it can't reach a Temporal server, it starts a
+Press Enter at each prompt to move to the next step. By default, the stage is
+live: it uses your model key and Stripe test key from `.env`, and asks for any
+that are missing (for that run only). Press Enter at that prompt, or pass
+`--offline`, to use a deterministic policy in place of a model and an offline
+Stripe-like ledger in place of Stripe. Without a terminal to ask, as in tests
+and CI, it runs offline. If it can't reach a Temporal server, it starts a
 local dev server. When it exits, it shuts down only the processes it started.
 
 **Cost.** Starting over pays for every model call again. Replay doesn't pay
 again for calls that already finished, so only a call that was in flight at
-the crash can run twice. These numbers were measured with `--real-model` on
-GPT-5.6 Luna on 2026-10-02:
+the crash can run twice. These numbers were measured on a live run on
+GPT-5.6 Luna on 2026-10-26 (the start-over on 2026-10-02):
 
-- A Demo 1 pass makes 4 model calls: 2,962 tokens, $0.0009. If the customer
+- A Demo 1 pass makes 4 model calls: 3,006 tokens, $0.0009. If the customer
   starts over, as Demo 1 tells them to, the redo makes 4 more calls: 2,972
   tokens, $0.0009 more.
-- A Demo 2 pass makes 4 model calls before the kill: 2,946 tokens, $0.0009.
+- A Demo 2 pass makes 4 model calls before the kill: 2,991 tokens, $0.0009.
   Replay after the kill makes 0 calls (0 tokens, $0).
 - Without `--real-model`, every stage run uses the fixed policy and makes no
   model calls (0 tokens, $0).
@@ -239,7 +243,7 @@ mode. You can use only one of them per run.
 refund Activity is in flight instead of before it:
 
 ```bash
-uv run refund-demo stage --simulate-stripe-timeout   # or: make failure
+uv run refund-demo stage --offline --simulate-stripe-timeout   # or: make failure
 ```
 
 1. Attempt 1 enters `issue_refund`, but the simulated Stripe API does not
@@ -672,7 +676,8 @@ model and whether it touches Stripe are separate choices:
 - `refund-demo start` calls the live model whenever a model key is set, even
   with `--dry-run`. Without a model key, it uses the deterministic policy and
   makes no model calls.
-- The stage uses a model only with `--real-model`.
+- The stage uses a model by default when the keys are set (it asks for
+  missing ones), with `--real-model`, and never with `--offline`.
 - `AGENT_MODEL_PROVIDER` selects `anthropic` or `openai`, and the CLI option
   `--model-provider` records that choice in the Workflow input.
 - For the refund, `--dry-run` writes to an offline Stripe-like ledger under

@@ -89,15 +89,9 @@ def _canned_step(request: RefundRequest, working_memory: list[dict]) -> AgentSte
 
     done = {obs.get("tool") for obs in working_memory}
     if TOOL_ORDER not in done:
-        return AgentStep(
-            action="use_tool", tool=TOOL_ORDER, tool_args={"order_id": request.order_id}
-        )
+        return AgentStep(action="use_tool", tool=TOOL_ORDER)
     if TOOL_HISTORY not in done:
-        return AgentStep(
-            action="use_tool",
-            tool=TOOL_HISTORY,
-            tool_args={"customer_id": request.customer_id},
-        )
+        return AgentStep(action="use_tool", tool=TOOL_HISTORY)
     history = _observation(working_memory, TOOL_HISTORY) or {}
     prior = len(history.get("prior_refunds") or [])
     clean = request.amount_cents <= APPROVE_THRESHOLD_CENTS and prior <= 1
@@ -111,11 +105,7 @@ def _canned_step(request: RefundRequest, working_memory: list[dict]) -> AgentSte
             ),
         )
     if TOOL_POLICY not in done:
-        return AgentStep(
-            action="use_tool",
-            tool=TOOL_POLICY,
-            tool_args={"order_id": request.order_id},
-        )
+        return AgentStep(action="use_tool", tool=TOOL_POLICY)
     return AgentStep(
         action="decide",
         recommendation="escalate",
@@ -125,6 +115,9 @@ def _canned_step(request: RefundRequest, working_memory: list[dict]) -> AgentSte
     )
 
 
+# The lookup tools take no arguments: the Workflow passes this run's order and
+# customer IDs, so the model chooses which tool to call but not whose records it
+# reads.
 _TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "type": "function",
@@ -147,21 +140,16 @@ _TOOL_SCHEMAS: list[dict[str, Any]] = [
         "type": "function",
         "name": TOOL_ORDER,
         "description": "Look up the order being refunded.",
-        "parameters": {
-            "type": "object",
-            "properties": {"order_id": {"type": "string"}},
-            "required": ["order_id"],
-        },
+        "parameters": {"type": "object", "properties": {}},
     },
     {
         "type": "function",
         "name": TOOL_HISTORY,
-        "description": "Look up the customer's tenure, purchases, and prior refunds.",
-        "parameters": {
-            "type": "object",
-            "properties": {"customer_id": {"type": "string"}},
-            "required": ["customer_id"],
-        },
+        "description": (
+            "Look up the customer's tenure, purchases, prior refunds, and notes "
+            "from past cases."
+        ),
+        "parameters": {"type": "object", "properties": {}},
     },
     {
         "type": "function",
@@ -169,11 +157,7 @@ _TOOL_SCHEMAS: list[dict[str, Any]] = [
         "description": (
             "Check authoritative refund eligibility and whether a return is required."
         ),
-        "parameters": {
-            "type": "object",
-            "properties": {"order_id": {"type": "string"}},
-            "required": ["order_id"],
-        },
+        "parameters": {"type": "object", "properties": {}},
     },
     {
         "type": "function",
@@ -198,7 +182,8 @@ _AGENT_INSTRUCTIONS = (
     "refund. When interactive_questions is true, use ask_customer to collect "
     "item_opened and damage one at a time unless customer_answer observations "
     "already contain them. Use the other tools to gather what you need, then "
-    "call submit_decision. "
+    "call submit_decision. The lookup tools act on this request's order and "
+    "customer, so they take no arguments. "
     "Treat tool results as authoritative. Approve clear, low-value refunds with "
     "a clean customer history. When the policy tool says eligible, approve; do "
     "not require a physical return when return_required is false. Escalate to a "

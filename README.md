@@ -11,6 +11,12 @@
 
 </div>
 
+> [!NOTE]
+> This is a teaching demo. It simulates a customer-support agent handling a
+> refund, with sample data in a small SQLite store, two scripted customer
+> questions, and Stripe test mode or an offline ledger. It shows the pattern
+> for keeping an agent's work durable, not a complete production setup.
+
 As agents run longer and take on more complex work, how they handle memory and
 state starts to matter. An agent that loses its place partway through a task
 can leave a customer repeating themselves, or leave a job half done. Managing
@@ -73,8 +79,8 @@ process. A new process can then pick up the work.
 - **Slides from the TAI meetup:** [*Agentic Memory and State*, in English and Japanese (PDF)](docs/agentic-memory-and-state-tai-meetup.pdf)
 - **Video:** [Watch the 13-minute walkthrough on YouTube](https://www.youtube.com/watch?v=cXKQkrgn-TE)
 
-**Last verified:** 2026-10-06 (offline demo, failure path, tests). Live model
-and Stripe test mode: 2026-10-02.
+**Last verified:** 2026-10-26 (live model and Stripe test mode, offline demo,
+tests). Failure path: 2026-10-06.
 
 ## Run it
 
@@ -84,7 +90,10 @@ and Stripe test mode: 2026-10-02.
 - [uv](https://docs.astral.sh/uv/), tested on 0.11.8
 - the [Temporal CLI](https://docs.temporal.io/cli?utm_source=github&utm_medium=readme&utm_campaign=temporalaimemory), tested on 1.6.2
 
-**Keys:** none for the default run.
+**Keys:** the default run is live, so it uses a model key (OpenAI or
+Anthropic) and a Stripe test key from `.env`. If one is missing, the demo asks
+for it for that run only, or you press Enter to run offline. Add `--offline`
+(or run `make run-offline`) to skip the keys entirely.
 
 ```bash
 git clone https://github.com/temporal-community/temporal-ai-agent-memory-state-stripe.git
@@ -121,9 +130,10 @@ without running it.
 | Target | Runs | Notes |
 | --- | --- | --- |
 | `make setup` | `uv sync --extra dev --extra tui` | Installs both extras. A `uv sync` without them removes the Rich terminal view. |
-| `make run` | `uv run refund-demo stage` | Runs the key-free path with the fixed policy and the offline ledger. It makes no model calls: 0 tokens, $0. |
-| `make run-real` | `uv run refund-demo stage --real` | Needs a Stripe test key, and creates Stripe test objects. |
-| `make failure` | `uv run refund-demo stage --simulate-stripe-timeout` | Runs offline and kills the Worker while `issue_refund` is in flight. A new Worker runs attempt 2 with the same idempotency key. For Stripe test mode, run the command with `--real`. |
+| `make run` | `uv run refund-demo stage` | The live run: a model and Stripe test mode. It asks for any missing key, or runs offline if you press Enter. See [Cost to run](#cost-to-run). |
+| `make run-offline` | `uv run refund-demo stage --offline` | Runs the key-free path with the fixed policy and the offline ledger. It makes no model calls: 0 tokens, $0. |
+| `make run-real` | `uv run refund-demo stage --real` | Stripe test mode with the fixed policy instead of a model. Needs a Stripe test key, and creates Stripe test objects. |
+| `make failure` | `uv run refund-demo stage --offline --simulate-stripe-timeout` | Runs offline and kills the Worker while `issue_refund` is in flight. A new Worker runs attempt 2 with the same idempotency key. For Stripe test mode, run the command with `--real`. |
 | `make reset` | `uv run refund-demo cleanup`, then prints the manual steps | Refunds only leftover demo test payments, and only with a Stripe test key. It deletes and stops nothing, and default runs need no reset. For everything else, see [reset between runs](docs/GUIDE.md#reset-between-takes). |
 | `make test` | `uv run --extra dev pytest -q` | Runs offline. A passing run ends with `N passed` and exit code 0. |
 | `make lint` | `uv run --extra dev ruff check .` and `uv run --extra dev ruff format --check .` | Runs offline. A passing run prints `All checks passed!` and `N files already formatted`. |
@@ -132,8 +142,11 @@ without running it.
 
 ### Keys and live paths
 
-<a id="choose-the-stage-path"></a>The default run needs no keys. Two flags swap
-a stand-in for a live service, and you can use either one or both.
+<a id="choose-the-stage-path"></a>The default run is live: it turns on both
+flags below when the keys are set, and asks for any that are missing. When no
+one is at the terminal to answer, as in tests and CI, it runs offline.
+`--offline` always runs offline. To pick one live service, pass a flag
+yourself:
 
 - **`--real`** swaps the offline ledger for Stripe test mode. It needs a
   `STRIPE_API_KEY` that starts with `sk_test_` or `rk_test_`; the demo rejects
@@ -150,9 +163,9 @@ a stand-in for a live service, and you can use either one or both.
     `claude-sonnet-4-6`. Some newer Claude models
     [reject this code's tool choice](docs/GUIDE.md#troubleshooting). The Claude
     figures in [Cost to run](#cost-to-run) are estimates, not measurements.
-  - If both model keys are set and you don't choose a provider, the demo stops
-    with an error that asks you to choose one. Pass `--model-provider`, or set
-    `AGENT_MODEL_PROVIDER`.
+  - If both model keys are set and you don't choose a provider, the default
+    run uses OpenAI, and `--real-model` stops with an error that asks you to
+    choose one. Pass `--model-provider`, or set `AGENT_MODEL_PROVIDER`.
   - [Cost to run](#cost-to-run) has the tokens and dollars, and the guide
     covers [live models](docs/GUIDE.md#live-models) in more depth.
 
@@ -167,7 +180,7 @@ for example from a coding agent, pipe in Enter presses. The run then accepts
 every default and exits 0:
 
 ```bash
-yes '' | uv run refund-demo stage
+yes '' | uv run refund-demo stage --offline
 ```
 
 </details>
@@ -219,9 +232,16 @@ hooks so you can watch recovery happen at a predictable moment.
 - **A real crash.** Each stop is a real SIGKILL, with no clean shutdown.
 - **Answers carried over.** Demo 1's answers go into Demo 2 as Signals, so you
   don't type them twice. Demo 1's new agent process never gets them.
-- **Stand-ins.** By default, a fixed policy stands in for the model, so the run
-  makes no model calls (0 tokens, $0), and an offline ledger stands in for
-  Stripe. Pass `--real-model` for a live model or `--real` for Stripe test
+- **Two scripted questions.** The agent always asks the same two questions
+  first (was the package opened, and what was damaged), even with a live
+  model, so every run reaches the crash at the same point. After that, the
+  model chooses its own lookups and decision.
+- **Sample data.** The lookups read a small SQLite store
+  ([store.py](src/refund_agent/store.py)) seeded with one order and one
+  customer. A real app reads its own systems.
+- **Offline stand-ins.** With `--offline`, a fixed policy stands in for the
+  model, so the run makes no model calls (0 tokens, $0), and an offline ledger
+  stands in for Stripe. The default run uses a live model and Stripe test
   mode.
 - **Failure drills.** Two optional runs stop the Worker in the middle of the
   refund Activity:
@@ -317,7 +337,10 @@ them:
 - **Execution state** is where the work stands, and Temporal records it. After
   the crash, a new Worker replays Event History and runs only the refund.
 - **Effect state** is whether the refund actually happened, and Stripe owns it.
-  Every retry sends the same idempotency key, so Stripe makes one refund.
+  Every retry sends the same idempotency key, so Stripe makes one refund. In
+  Temporal's terms, Stripe is the source of truth for the effect, the
+  `issue_refund` Activity result is the Workflow's record of it, and the
+  idempotency key reconciles the two when a crash lands in between.
 
 Memory helps the reasoning continue, and Temporal helps the operation continue.
 
@@ -329,7 +352,7 @@ table shows what each one is in this demo and where to find it.
 | | What it helps with | In this demo | Where to find it |
 | --- | --- | --- | --- |
 | **Context** (working memory) | What the model sees for this one decision.<br>The loop sends it again on every turn | The customer's refund request, their two answers, and what the agent has looked up so far: order 1234 and the refund history of the demo customer, Nyghtowl | `working_memory`.<br>Demo 1: a list in the agent process (`naive_refund.py`).<br>Demo 2: a Workflow field (`workflow.py`) that replay rebuilds.<br>In Event History: the input of each `agent_decide_next_step` Activity |
-| **Long-term memory** (a memory store) | What the agent carries across runs:<br>Episodic: past cases.<br>Semantic: facts it looks up.<br>Procedural: how-to, such as skill files and tool definitions | None, on purpose. The demo saves nothing between runs.<br>Lookups are labeled `(memory)` on screen because they stand in for a memory store, but they read sample data, and each result becomes part of context once the agent looks it up | Your store: a vector store, a knowledge base, or memory files |
+| **Long-term memory** (a memory store) | What the agent carries across runs:<br>Episodic: past cases.<br>Semantic: facts it looks up.<br>Procedural: how-to, such as skill files and tool definitions | A light version. After the refund, `remember_case` saves a short case note to the demo's SQLite store, and `lookup_customer_history` reads notes back as `past_cases` on later runs.<br>Each guided run starts from fresh data, so the demo plays the same way every time. Each lookup result becomes part of context once the agent reads it | Your store: a vector store, a knowledge base, or memory files.<br>Here: `store.sqlite` in the run's state folder |
 | **Execution state** | Where the work stands: which steps finished and what runs next, so the work can continue after a crash without redoing it | The progress Temporal recorded before the crash: the customer answered two questions, the agent finished two lookups (three when a live model also checks the refund policy), and its next step is to issue the refund | Temporal: the Workflow's Event History in the Temporal Web UI, or `uv run refund-demo inspect <workflow-id>` |
 | **Effect state** | Whether the side effect really happened | Whether Stripe actually refunded the payment | Stripe: the Dashboard in test mode. The refund's metadata carries `temporal_workflow_id` and `temporal_idempotency_key`.<br>Offline: the ledger |
 
@@ -360,17 +383,26 @@ For any fact, ask whether another system already owns it. Asked of every fact,
 that question finds more kinds of state than the four in this table, such as
 token budgets, locks, and quotas.
 
-**Temporal is not a memory store.** It records execution state, such as one
-run's Signals and its Activity inputs and results, in Event History, which
-lives in the Temporal Service rather than in the Worker. That's enough to
-rebuild this run's working memory by replay, but it isn't a place to keep what
-the agent knows from one run to the next.
+<a id="temporal-is-not-a-memory-store"></a>**What Temporal keeps, and what needs a memory store.**
+Temporal records every Activity's inputs and results, and every Signal, in
+Event History, which lives in the Temporal Service rather than in the Worker.
+For this agent, that includes each model call's input (the request and working
+memory) and its output (the next step, and the written rationale when it
+decides), plus the customer's answers. So replay rebuilds this run's working
+memory after a crash, with no code to save it. The model's internal reasoning
+isn't returned by the provider, so it isn't recorded anywhere.
 
-- Long-term memory belongs in a store you own.
-- Event History has size limits, described under [Gotchas](#gotchas).
-- Temporal can run the store's reads and writes as Activities, so each one is
+What Temporal doesn't do is carry knowledge from one run to the next:
+
+- Long-term memory belongs in a store you own. In this demo, `remember_case`
+  writes a case note to the SQLite store, and `lookup_customer_history` reads
+  it back.
+- Temporal runs the store's reads and writes as Activities, so each one is
   recorded and retried like any other step.
-- How best to combine the two is still an open design question.
+- Memory products such as mem0 and Amazon Bedrock AgentCore Memory decide what
+  to keep, when to write it, and what to bring back into context. They plug in
+  the same way, through Activities.
+- Event History has size limits, described under [Gotchas](#gotchas).
 
 <details>
 <summary>More on memory, state, and authority</summary>
@@ -643,23 +675,23 @@ again; only a call that was in flight at the crash can run twice.
 
 The measured runs show the difference between the two demos:
 
-- Before the kill, each demo's pass made 4 model calls: 2,962 tokens and
-  $0.0009 in Demo 1, and 2,946 tokens and $0.0009 in Demo 2.
+- Before the kill, each demo's pass made 4 model calls: 3,006 tokens and
+  $0.0009 in Demo 1, and 2,991 tokens and $0.0009 in Demo 2.
 - After the kill, Demo 1's customer has to start over, which costs 4 more
   calls: 2,972 tokens and $0.0009 more.
 - After the kill, Demo 2's replay made 0 calls, so it cost 0 tokens and $0.
 
-These figures come from `--real-model` on GPT-5.6 Luna, measured on 2026-10-02
-at list prices as of 2026-09-29. Without `--real-model`, the demo uses a fixed
-policy and makes no model calls, so it costs 0 tokens and $0. `--real` alone
-also makes no model calls.
+These figures come from a live run on GPT-5.6 Luna, measured on 2026-10-26
+(the start-over on 2026-10-02) at list prices as of 2026-09-29. Offline, the
+demo uses a fixed policy and makes no model calls, so it costs 0 tokens and $0.
+`--real` alone also makes no model calls.
 
 | Run | Calls | Tokens | Dollars | Basis |
 | --- | --- | --- | --- | --- |
-| Demo 1 pass, `gpt-5.6-luna` | 4 | 2,962<br>In: 2,619, 0 cached<br>Out: 343, 87 reasoning | $0.0009 | **Measured**, 2026-10-02 |
+| Demo 1 pass, `gpt-5.6-luna` | 4 | 3,006<br>In: 2,713, 0 cached<br>Out: 293, 78 reasoning | $0.0009 | **Measured**, 2026-10-26 |
 | Demo 1 start-over, as the customer must | 4 more | 2,972<br>In: 2,623<br>Out: 349, 97 reasoning | $0.0009 more | **Measured**, 2026-10-02 |
-| Demo 2 pass, before the kill | 4 | 2,946<br>In: 2,611<br>Out: 335, 84 reasoning | $0.0009 | **Measured**, 2026-10-02 |
-| Demo 2 replay after the kill | 0 | 0 | $0.00 | **Measured**, 2026-10-02 |
+| Demo 2 pass, before the kill | 4 | 2,991<br>In: 2,709<br>Out: 282, 75 reasoning | $0.0009 | **Measured**, 2026-10-26 |
+| Demo 2 replay after the kill | 0 | 0 | $0.00 | **Measured**, 2026-10-26 |
 | Each demo, or a Demo 1 start-over, on `claude-sonnet-4-6` | about 4 | about 5,600-7,300<br>In: 5,400-6,900<br>Out: 200-400 | about $0.02-$0.03 | **Estimated**, 2026-09-29<br>Not run |
 
 <!-- After a measured Claude pass, replace the Claude estimate with the
@@ -866,6 +898,9 @@ allow 2 MB per payload and 50 MB per run. This demo stops at
   refund attempted in a new run would carry a different key, and Stripe
   couldn't tell it was a retry.
 
+This demo describes both patterns but doesn't implement them. More examples
+that do are coming.
+
 </details>
 
 **A step can run more than once.** Replay doesn't redo finished steps, but a
@@ -938,8 +973,8 @@ Temporal Web UI, where Workflow and Activity failures show, or see the
 
 The video ran
 `uv run refund-demo stage --real --real-model --model-provider openai` with an
-OpenAI key and a Stripe test key. Without keys, `make run` tells the same story
-offline.
+OpenAI key and a Stripe test key, which is now what `make run` does. Without
+keys, `make run-offline` tells the same story offline.
 
 <details>
 <summary>Chapters</summary>

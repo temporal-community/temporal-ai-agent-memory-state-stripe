@@ -10,7 +10,10 @@ code. It uses the README's four kinds of information, in the README's order:
   current decision; here it is the `working_memory` list, which lives in the
   agent process in Demo 1 and in the Workflow in Demo 2.
 - **Long-term memory** is what an agent carries from one run to the next, and
-  it lives in a store you own; this demo keeps none, on purpose.
+  it lives in a store you own. Here that is a light version: `remember_case`
+  saves a case note to the SQLite demo store (`src/refund_agent/store.py`)
+  after the refund, and `lookup_customer_history` reads notes back as
+  `past_cases`. Each stage run starts from fresh seed data.
 - **Execution state** is where the work stands, and Temporal records it in
   Event History, which lives in the Temporal Service rather than in the
   Worker.
@@ -159,11 +162,15 @@ the order row still wins.
 ## Important paths
 
 - `src/refund_agent/stage.py`: guided single-terminal talk path
+- `src/refund_agent/store.py`: the SQLite demo store the lookups read and
+  `remember_case` writes; it stands in for the business systems and a memory
+  store
 - `src/refund_agent/tui.py`: technical and general-audience panels
 - `src/refund_agent/workflow.py`: Demo 2's agent loop (the
   `RefundApprovalAgent` Workflow) and its Activity boundary
 - `src/refund_agent/activities/`: the Activities, split by role. `model.py` holds
-  the model turn and usage logging, `tools.py` the three lookups, `refund.py`
+  the model turn and usage logging, `tools.py` the three lookups and the
+  `remember_case` memory write, `refund.py`
   the refund side effect and its idempotency key, and `view.py` the display
   helpers. Activity names must not change: Event History and
   `tests/test_replay.py` refer to them by name.
@@ -205,10 +212,10 @@ CI (`.github/workflows/ci.yml`) runs the same lint, type check, and tests on
 every push to `main` and on every pull request.
 
 Changes to stage copy or control flow also require a complete offline rehearsal
-(`make run`):
+(`make run-offline`):
 
 ```bash
-uv run refund-demo stage
+uv run refund-demo stage --offline
 ```
 
 Verify the content is visible at the intended terminal size, not merely present
@@ -236,8 +243,9 @@ longest line at those widths, not only at 128, the width
     Temporal. It owns Event History growth, its limits, the claim check, and
     Continue-As-New.
 - These wording rules apply to every doc:
-  - Temporal is not a memory store. It records execution state in Event
-    History, so say Temporal “records,” never “remembers.”
+  - Temporal records this run's working memory (Activity inputs and results)
+    in Event History, so say Temporal “records,” never “remembers.” Long-term
+    memory lives in a store you own, here the SQLite demo store.
   - Stripe, or the offline ledger, owns whether the refund happened. Never say
     Temporal tracks the refund's state.
   - Give cost in tokens and dollars together, and never make “$0” a headline.

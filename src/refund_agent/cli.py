@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import getpass
 import json
 import os
 import signal
+import sys
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -422,6 +425,76 @@ async def _watch(args: argparse.Namespace) -> None:
     await tui.watch(args.workflow_id)
 
 
+_MODEL_KEYS = {"openai": "OPENAI_API_KEY", "anthropic": "ANTHROPIC_API_KEY"}
+_MODEL_NAMES = {"openai": "OPENAI_MODEL", "anthropic": "ANTHROPIC_MODEL"}
+_PROVIDER_LABELS = {"openai": "OpenAI", "anthropic": "Anthropic"}
+
+
+def choose_stage_mode(
+    args: argparse.Namespace,
+    *,
+    interactive: bool,
+    ask: Callable[[str], str] = input,
+    ask_secret: Callable[[str], str] = getpass.getpass,
+) -> tuple[bool, bool, str | None]:
+    """Pick (real Stripe, real model, provider) for `refund-demo stage`.
+
+    The default is the live run: a live model and Stripe test mode. Keys come
+    from .env or the shell. When one is missing and a person is at the
+    terminal, ask for it for this run only (it is not saved); pressing Enter
+    runs the offline demo instead. Without a terminal, as in tests and CI, the
+    run goes offline. --offline, --real, and --real-model skip the choice.
+    """
+
+    if args.offline:
+        return False, False, None
+    if args.real or args.real_model:
+        return args.real, args.real_model, args.model_provider
+
+    provider = args.model_provider or os.getenv("AGENT_MODEL_PROVIDER") or None
+    if provider is None:
+        with_keys = [name for name, key in _MODEL_KEYS.items() if os.getenv(key)]
+        # The video used OpenAI, so it wins when both keys are set.
+        provider = with_keys[0] if with_keys else "openai"
+    provider = provider.strip().lower()
+    if provider not in _MODEL_KEYS:
+        raise RuntimeError("model provider must be 'anthropic' or 'openai'")
+
+    needed = [
+        (_MODEL_KEYS[provider], f"{_PROVIDER_LABELS[provider]} API key", True),
+        (_MODEL_NAMES[provider], f"{_PROVIDER_LABELS[provider]} model name", False),
+        ("STRIPE_API_KEY", "Stripe test key (sk_test_ or rk_test_)", True),
+    ]
+    missing = [item for item in needed if not os.getenv(item[0])]
+    if missing and not interactive:
+        names = ", ".join(name for name, _, _ in missing)
+        print(f"STAGE | Offline run: {names} not set, and no terminal to ask.")
+        return False, False, None
+    if missing:
+        print("The live run uses a model and Stripe test mode. Still needed:")
+        for _, label, _ in missing:
+            print(f"  - {label}")
+        print("Values you enter are used for this run only and are not saved.")
+        for name, label, secret in missing:
+            prompt = f"{label} (press Enter to run the offline demo instead): "
+            value = (ask_secret(prompt) if secret else ask(prompt)).strip()
+            if not value:
+                print("STAGE | Running the offline demo.")
+                return False, False, None
+            if name == "STRIPE_API_KEY":
+                try:
+                    validate_stripe_key(value, required=True)
+                except RuntimeError as error:
+                    print(f"STAGE | {error}. Running the offline demo.")
+                    return False, False, None
+            os.environ[name] = value
+    print(
+        f"STAGE | Live run: {_PROVIDER_LABELS[provider]} model and Stripe test "
+        "mode. For the offline demo, use `make run-offline`."
+    )
+    return True, True, provider
+
+
 async def _stage(args: argparse.Namespace) -> None:
     # Lazy import: the regular CLI still works without the optional Rich extra.
     try:
@@ -430,12 +503,15 @@ async def _stage(args: argparse.Namespace) -> None:
         print("The stage view needs rich. Install it with: uv sync --extra tui")
         return
     try:
+        real, real_model, provider = choose_stage_mode(
+            args, interactive=sys.stdin.isatty()
+        )
         await run(
             workflow_id=args.workflow_id,
-            real=args.real,
-            real_model=args.real_model,
+            real=real,
+            real_model=real_model,
             amount_cents=8000,
-            model_provider=args.model_provider,
+            model_provider=provider,
             simulate_stripe_retry=args.simulate_stripe_retry,
             simulate_stripe_timeout=args.simulate_stripe_timeout,
         )
@@ -703,6 +779,11 @@ def _parser() -> argparse.ArgumentParser:
         help="run both demos in one guided terminal (starts and restarts its Worker)",
     )
     stage.add_argument("--workflow-id")
+    stage.add_argument(
+        "--offline",
+        action="store_true",
+        help="run offline: the fixed policy and the offline ledger, no keys",
+    )
     stage.add_argument(
         "--real",
         action="store_true",

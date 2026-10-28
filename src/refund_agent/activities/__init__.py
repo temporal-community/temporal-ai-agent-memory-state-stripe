@@ -3,12 +3,14 @@
 The agent loop lives in the Workflow. Each turn it calls agent_decide_next_step
 (the model), which either asks for a tool or reaches a decision. The tools
 (lookup_order, lookup_customer_history, check_refund_policy) retrieve domain
-records whose results become the agent's working memory, and issue_refund is
-the one external effect.
+records whose results become the agent's working memory, issue_refund is the
+one external effect, and remember_case saves a case note to long-term memory
+after the refund.
 
 The code is split by role:
 
-- tools.py: the three lookup Activities.
+- tools.py: the three lookup Activities and remember_case. They read and
+  write the demo's SQLite store (refund_agent/store.py).
 - model.py: agent_decide_next_step, the fixed policy, the live model calls,
   and usage logging.
 - refund.py: issue_refund, the Stripe call, and the idempotency key.
@@ -34,6 +36,7 @@ from refund_agent.activities.tools import (
     check_refund_policy,
     lookup_customer_history,
     lookup_order,
+    remember_case,
 )
 from refund_agent.activities.view import show_empty_agent_view
 
@@ -51,5 +54,6 @@ __all__ = [
     "issue_refund",
     "lookup_customer_history",
     "lookup_order",
+    "remember_case",
     "show_empty_agent_view",
 ]
