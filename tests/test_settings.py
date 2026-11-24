@@ -6,9 +6,9 @@ from pathlib import Path
 import pytest
 
 from refund_agent.settings import (
-    agent_view_path,
-    effect_restart_window_seconds,
     model_usage_path,
+    refund_hold_marker,
+    refund_restart_window_seconds,
     temporal_identity,
     validate_stripe_key,
 )
@@ -72,22 +72,18 @@ def test_missing_key_is_allowed_for_dry_run() -> None:
     assert validate_stripe_key(None, required=False) is None
 
 
-def test_agent_view_path_stays_inside_state_directory(tmp_path, monkeypatch) -> None:
+def test_refund_hold_marker_stays_inside_state_directory(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("DEMO_STATE_DIR", str(tmp_path))
 
-    path = agent_view_path("../../another/workflow")
-
-    assert path.parent == tmp_path
-    assert path.name.startswith("agent-view-")
-    assert "/" not in path.name
+    assert refund_hold_marker().parent == tmp_path
 
 
 @pytest.mark.parametrize("value", ["-1", "nan", "inf", "not-a-number"])
-def test_effect_restart_window_rejects_invalid_values(value, monkeypatch) -> None:
-    monkeypatch.setenv("EFFECT_RESTART_WINDOW_SECONDS", value)
+def test_refund_restart_window_rejects_invalid_values(value, monkeypatch) -> None:
+    monkeypatch.setenv("REFUND_RESTART_WINDOW_SECONDS", value)
 
     with pytest.raises(RuntimeError, match="finite number"):
-        effect_restart_window_seconds()
+        refund_restart_window_seconds()
 
 
 @pytest.mark.parametrize("value", [None, "", "0", "false", "No"])

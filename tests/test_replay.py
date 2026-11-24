@@ -9,18 +9,21 @@ it up. This test replays a real recorded history against the current
 RefundWorkflow code, offline and without a Temporal server, so that kind of
 change fails here instead of on stage.
 
-The fixture, tests/histories/stage_offline.json, is the complete Event History
-of one offline guided stage run (`refund-demo stage`): canned policy, the
-offline Stripe ledger, and no keys. It includes the Worker being killed before
-the refund and a new Worker finishing the run: the old Worker's sticky task
-times out (event 57), and the new Worker replays the history and issues the
-refund.
+The fixture, tests/histories/stage_offline_worker_hooks.json, is the complete
+Event History of one offline guided stage run (`refund-demo stage --offline`):
+the fixed policy, the offline Stripe ledger, and no keys. The agent asks two
+questions, looks up the order and the customer's history, searches past cases
+with search_memory, and approves. The stage's Worker hook (demo_hooks.py)
+holds issue_refund attempt 1 before Stripe; the stage kills that Worker, and
+a new Worker runs attempt 2, then remember_case.
 
-If test_current_workflow_replays_recorded_stage_run fails after a change, the
-change would break Workflows that are already running. Keep the old behavior
-for histories that already exist, using workflow.patched() or a new Workflow
-type. Regenerate the fixture only when you mean to drop support for those
-histories.
+This is a demo, so the repository carries no compatibility code for runs
+recorded by older code: finish or terminate running demo Workflows before
+upgrading (AGENTS.md, "Changing the Workflow safely"). When a change alters
+the Workflow's commands on purpose, re-record the fixture as below so this
+test replays a history from the current code. If the test fails after a
+change you did not mean to make to the commands, the change would break
+Workflows that are already running; fix the change, not the fixture.
 
 How to regenerate the fixture, from the repository root:
 
@@ -34,8 +37,10 @@ How to regenerate the fixture, from the repository root:
            --db-filename /tmp/replay-fixture/temporal.db
 
 3. In a second terminal, run the offline stage unattended. Pressing Enter at
-   every prompt accepts each default answer. DOTENV_PATH=/dev/null keeps values
-   from .env (such as a Temporal Cloud namespace) out of the run. Unsetting
+   every prompt accepts each default answer. --offline is required, because
+   without a terminal a run with missing keys fails instead of going offline.
+   DOTENV_PATH=/dev/null keeps values from .env (such as a Temporal Cloud
+   namespace) out of the run. Unsetting
    TEMPORAL_IDENTITY and setting TEMPORAL_NAMESPACE keep values exported in
    your shell out of it too. DEMO_STATE_DIR keeps the stage files out of the
    repository:
@@ -43,13 +48,14 @@ How to regenerate the fixture, from the repository root:
        yes '' | env -u TEMPORAL_IDENTITY DOTENV_PATH=/dev/null \
            TEMPORAL_ADDRESS=127.0.0.1:7263 TEMPORAL_NAMESPACE=default \
            DEMO_STATE_DIR=/tmp/replay-fixture/state \
-           uv run refund-demo stage --workflow-id replay-fixture-offline
+           uv run refund-demo stage --offline \
+           --workflow-id replay-fixture-offline-hooks
 
 4. Export the completed history:
 
-       temporal workflow show --workflow-id replay-fixture-offline \
+       temporal workflow show --workflow-id replay-fixture-offline-hooks \
            --address 127.0.0.1:7263 --namespace default --output json \
-           > tests/histories/stage_offline.json
+           > tests/histories/stage_offline_worker_hooks.json
 
 5. Stop the dev server with Ctrl+C and delete /tmp/replay-fixture.
 6. Before committing, search the new file for hostnames, usernames, file paths,
@@ -72,13 +78,14 @@ from refund_agent.activities import lookup_order
 from refund_agent.models import RefundRequest
 from refund_agent.workflow import RefundWorkflow
 
-HISTORY_PATH = Path(__file__).parent / "histories" / "stage_offline.json"
-WORKFLOW_ID = "replay-fixture-offline"
+HISTORIES = Path(__file__).parent / "histories"
+RECORDED_RUN = HISTORIES / "stage_offline_worker_hooks.json"
+RECORDED_WORKFLOW_ID = "replay-fixture-offline-hooks"
 
 
 def _recorded_history() -> WorkflowHistory:
     return WorkflowHistory.from_json(
-        WORKFLOW_ID, HISTORY_PATH.read_text(encoding="utf-8")
+        RECORDED_WORKFLOW_ID, RECORDED_RUN.read_text(encoding="utf-8")
     )
 
 

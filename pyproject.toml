@@ -31,7 +31,6 @@ tui = [
 [project.scripts]
 refund-demo = "refund_agent.cli:main"
 refund-worker = "refund_agent.worker:main"
-permission-chat = "refund_agent.permission_chat:main"
 naive-refund = "refund_agent.naive_refund:main"
 
 [tool.setuptools.packages.find]

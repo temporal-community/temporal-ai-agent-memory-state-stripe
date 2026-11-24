@@ -17,18 +17,16 @@ run, and the two fixes: a claim check and Continue-As-New.
 
 On every turn, the `RefundApprovalAgent` Workflow passes the request and the
 whole `working_memory` list to `agent_decide_next_step`
-([`workflow.py`](../src/refund_agent/workflow.py)), and `issue_refund` receives
-the list once more. Each tool result is recorded once as that tool's result,
+([`workflow.py`](../src/refund_agent/workflow.py)). Each tool result is recorded once as that tool's result,
 then again inside every later `agent_decide_next_step` input. After N tool
 turns, the recorded bytes grow with N squared, not N.
 
 In this demo the history stays small, because the loop stops at
-`MAX_TURNS = 10`. With the default refund request of `refund-demo stage`, the
-`agent_decide_next_step` input grows from about 0.5 KB to about 1.1 KB over
-five turns, and all Activity payloads together come to under 7 KB. Those sizes
-come from serializing the default values with the SDK's default converter, not
-from a live run, and what you type as the refund request changes them
-slightly. To get the real number for your run, read it in the
+`MAX_TURNS = 10`. In the offline stage run recorded in
+`tests/histories/stage_offline_worker_hooks.json`, the `agent_decide_next_step`
+input grows from about 0.3 KB to about 1.5 KB over six turns, and all Activity
+payloads together come to about 8 KB. A live model's turns differ, and what
+you type as the refund request changes the sizes slightly. To get the real number for your run, read it in the
 [Temporal Web UI](#see-it-in-the-temporal-web-ui).
 
 The problem appears when tool results are large and the loop runs long.
@@ -213,12 +211,11 @@ Rules:
   or `except BaseException` around the call would swallow it.
 - Version the carried state's shape, because running Workflows continue into
   new code.
-- In this repo, roll over only before `issue_refund`. Its Stripe idempotency
-  key includes the Run ID, which Continue-As-New changes, so a refund retried
-  in the new run would carry a different key and Stripe couldn't tell it was a
-  retry. If a key ever has to survive Continue-As-New, derive it from
-  `workflow.info().first_execution_run_id`, not from the request ID, which
-  defaults to the Workflow ID and would collide across reused IDs.
+- In this repo, `issue_refund` derives its Stripe idempotency key from the
+  Workflow ID, which Continue-As-New keeps, so a refund retried in the new run
+  sends the same key and Stripe treats it as a retry. Stripe keeps keys for
+  about 24 hours, so a refund retried later than that still needs an Stripe
+  check: list the PaymentIntent's refunds first.
 
 For working patterns, see
 [Continue-As-New](https://docs.temporal.io/design-patterns/continue-as-new),

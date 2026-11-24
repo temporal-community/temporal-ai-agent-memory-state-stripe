@@ -1,29 +1,32 @@
-"""The one external effect: the issue_refund Activity.
+"""The one side effect: the issue_refund Activity and the refund call.
 
-It sends one refund with an idempotency key derived from the Workflow run, to
-the offline ledger by default or to Stripe test mode with --real. Stripe's own
-retries are off, so every retry is a Temporal Activity attempt.
+issue_refund sends one refund with an idempotency key derived from the Workflow
+ID, through refund_payment: to the offline ledger by default or to Stripe test
+mode with --real. Demo 1's agent process calls refund_payment directly. Stripe's
+own retries are off, so every retry is a Temporal Activity attempt.
+
+Demo-only pauses and simulated failures are not here. The stage applies them at
+the Worker edge with an interceptor (refund_agent/demo_hooks.py).
 """
 
 from __future__ import annotations
 
 import concurrent.futures
 import os
-import time
-from dataclasses import asdict
+from collections.abc import Callable
 from datetime import timedelta
+from typing import Any
 
 import stripe
 from temporalio import activity
 from temporalio.exceptions import ApplicationError
 
-from refund_agent.activities.view import _line, _mirror_agent_view, _view_for
-from refund_agent.fake_stripe import create_refund, idempotency_key_for, record_effect
+from refund_agent.fake_stripe import create_refund, idempotency_key_for, record_refund
 from refund_agent.models import RefundDecision, RefundRequest, RefundResult
-from refund_agent.settings import effect_restart_window_seconds, validate_stripe_key
+from refund_agent.settings import validate_stripe_key
 
 # ---------------------------------------------------------------------------
-# The one external effect.
+# The one side effect.
 # ---------------------------------------------------------------------------
 
 # Stripe's HTTP client waits up to 80 s by default. The refund call instead
@@ -117,13 +120,56 @@ def _real_stripe_refund(
     }
 
 
-@activity.defn
-def issue_refund(
+def _call_directly(call: Callable[..., Any], *args: Any) -> Any:
+    return call(*args)
+
+
+def refund_payment(
     request: RefundRequest,
-    decision: RefundDecision,
-    working_memory: list[dict] | None = None,
-) -> RefundResult:
-    """EXTERNAL EFFECT: issue one idempotency-keyed refund."""
+    *,
+    workflow_id: str,
+    idempotency_key: str,
+    run_blocking: Callable[..., Any] = _call_directly,
+) -> tuple[dict[str, object], str]:
+    """Send one idempotency-keyed refund and return (refund, mode).
+
+    Both demos refund through this function. dry_run sends it to the offline
+    ledger (the Stripe stand-in in fake_stripe.py), which honors the
+    idempotency key the same way; otherwise it goes to Stripe test mode.
+    run_blocking wraps the Stripe call; the Activity passes
+    _call_with_heartbeats. Raises ValueError when the key was reused with
+    different parameters, and stripe.StripeError when Stripe refuses.
+    """
+
+    if request.dry_run:
+        # Offline ledger (demo-only), so the demo runs without a Stripe key. A
+        # real app calls Stripe, as below.
+        stripe_refund = create_refund(
+            workflow_id=workflow_id,
+            payment_intent_id=request.payment_intent_id,
+            amount_cents=request.amount_cents,
+            idempotency_key=idempotency_key,
+        )
+        return stripe_refund, "dry-run"
+    stripe_refund = run_blocking(
+        _real_stripe_refund, request, workflow_id, idempotency_key
+    )
+    # Mirror the real refund locally so the panel can show one refund and its
+    # call count. Stripe stays the system of record.
+    record_refund(
+        workflow_id=workflow_id,
+        refund_id=str(stripe_refund["refund_id"]),
+        status=str(stripe_refund["status"]),
+        amount_cents=int(stripe_refund["amount_cents"]),
+        payment_intent_id=request.payment_intent_id,
+        idempotency_key=idempotency_key,
+    )
+    return stripe_refund, "stripe-test"
+
+
+@activity.defn
+def issue_refund(request: RefundRequest, decision: RefundDecision) -> RefundResult:
+    """SIDE EFFECT: issue one idempotency-keyed refund."""
 
     info = activity.info()
     workflow_id = info.workflow_id
@@ -134,153 +180,60 @@ def issue_refund(
             non_retryable=True,
         )
 
-    # IDEMPOTENCY KEY: derived from the workflow RUN identity. It stays stable
-    # across a restart retry (the same run keeps its run id) but is fresh for a
-    # brand new run, so reusing a workflow id never collides with an earlier
-    # run's effect.
-    run_id = info.workflow_run_id
-    idempotency_key = idempotency_key_for(f"{workflow_id}:{run_id}")
-
-    # Rebuild THE AGENT view from the recovered steps, so a Worker resuming this
-    # effect after a restart repopulates its in-process panel instead of staying
-    # blank. Temporal restored working_memory by replay; this only shows it.
-    if working_memory is None:
-        working_memory = []
-    view = _view_for(workflow_id)
-    view["context"] = asdict(request)
-    view["observations"] = working_memory
-    view["decision"] = {
-        "recommendation": decision.recommendation,
-        "rationale": decision.rationale,
-        "source": decision.source,
-    }
-    _mirror_agent_view(workflow_id, view)
-
-    _line(
-        "EXECUTION STATE",
-        f"issuing refund: attempt {info.attempt}, decision "
-        f"{decision.recommendation}, idempotency key ...{idempotency_key[-8:]}",
+    # IDEMPOTENCY KEY: derived from the Workflow ID, the refund's business
+    # identity (one refund request = one Workflow ID). Every attempt, a reset,
+    # and a new run started under the same Workflow ID all send the same key,
+    # so Stripe returns the first refund instead of creating a second one.
+    # Stripe keeps keys for about 24 hours, so a reset after that needs an
+    # Stripe check (list the PaymentIntent's refunds) before refunding again.
+    idempotency_key = idempotency_key_for(workflow_id)
+    activity.logger.info(
+        f"EXECUTION STATE | issuing refund: attempt {info.attempt}, decision "
+        f"{decision.recommendation}, idempotency key ...{idempotency_key[-8:]}"
     )
 
-    if request.simulate_stripe_timeout and info.attempt == 1:
-        # Failure drill (demo-only, stage --simulate-stripe-timeout). Attempt 1
-        # hangs before the effect, like a call to a Stripe API that never
-        # answers, so Stripe accepts nothing. The stage kills this Worker; after
-        # the heartbeat timeout, Temporal schedules attempt 2, which waits for a
-        # new Worker. A real app has no such branch: a real hang fails on
-        # STRIPE_TIMEOUT_SECONDS, and Temporal retries it.
-        _line(
-            "THE SYSTEM",
-            "Stripe API is not responding (simulated); no refund accepted",
+    try:
+        stripe_refund, mode = refund_payment(
+            request,
+            workflow_id=workflow_id,
+            idempotency_key=idempotency_key,
+            # Heartbeat while Stripe answers, so a slow call keeps this attempt
+            # alive instead of looking like a lost Worker.
+            run_blocking=_call_with_heartbeats,
         )
-        deadline = time.monotonic() + 30
-        while time.monotonic() < deadline:
-            time.sleep(min(1.0, max(0.0, deadline - time.monotonic())))
+    except ValueError as error:
         raise ApplicationError(
-            "simulated Stripe API timeout",
-            type="StripeAPITimeout",
-        )
+            str(error),
+            type="IdempotencyConflict",
+            non_retryable=True,
+        ) from error
+    except stripe.StripeError as error:
+        message = getattr(error, "user_message", None) or str(error)
+        if _stripe_error_is_retryable(error):
+            # Fail this attempt only. The retry policy runs the next one with
+            # the same idempotency key, after Retry-After if Stripe sent one.
+            raise ApplicationError(
+                f"Stripe refund call failed (retryable): {message}",
+                type="StripeRetryableError",
+                next_retry_delay=_stripe_retry_delay(error),
+            ) from error
+        # A bad PaymentIntent or similar cannot be fixed by retrying, so fail
+        # fast with a readable message instead of retrying and then surfacing
+        # an opaque "Activity task failed".
+        raise ApplicationError(
+            f"Stripe rejected the refund: {message}",
+            type="StripeRefundError",
+            non_retryable=True,
+        ) from error
 
-    if request.dry_run:
-        # Offline ledger (demo-only): the local Stripe stand-in in fake_stripe.py
-        # takes the refund and honors the idempotency key the same way, so the
-        # demo runs without a Stripe key. A real app calls Stripe, as below.
-        try:
-            effect = create_refund(
-                workflow_id=workflow_id,
-                payment_intent_id=request.payment_intent_id,
-                amount_cents=request.amount_cents,
-                idempotency_key=idempotency_key,
-            )
-        except ValueError as error:
-            raise ApplicationError(
-                str(error),
-                type="IdempotencyConflict",
-                non_retryable=True,
-            ) from error
-        mode = "dry-run"
-    else:
-        try:
-            effect = _call_with_heartbeats(
-                _real_stripe_refund, request, workflow_id, idempotency_key
-            )
-        except stripe.StripeError as error:
-            message = getattr(error, "user_message", None) or str(error)
-            if _stripe_error_is_retryable(error):
-                # Fail this attempt only. The retry policy runs the next one
-                # with the same idempotency key, after Retry-After if Stripe
-                # sent one.
-                raise ApplicationError(
-                    f"Stripe refund call failed (retryable): {message}",
-                    type="StripeRetryableError",
-                    next_retry_delay=_stripe_retry_delay(error),
-                ) from error
-            # A bad PaymentIntent or similar cannot be fixed by retrying, so
-            # fail fast with a readable message instead of retrying and then
-            # surfacing an opaque "Activity task failed".
-            raise ApplicationError(
-                f"Stripe rejected the refund: {message}",
-                type="StripeRefundError",
-                non_retryable=True,
-            ) from error
-        mode = "stripe-test"
-        # Mirror the real refund locally so the panel can show one refund and
-        # its call count. Stripe stays the system of record.
-        try:
-            record_effect(
-                workflow_id=workflow_id,
-                refund_id=str(effect["refund_id"]),
-                status=str(effect["status"]),
-                amount_cents=int(effect["amount_cents"]),
-                payment_intent_id=request.payment_intent_id,
-                idempotency_key=idempotency_key,
-            )
-        except ValueError as error:
-            raise ApplicationError(
-                str(error),
-                type="IdempotencyConflict",
-                non_retryable=True,
-            ) from error
-
-    _line(
-        "THE SYSTEM",
-        f"refund accepted at Stripe: {effect['refund_id']} "
-        f"({mode}, attempt {info.attempt})",
+    activity.logger.info(
+        f"THE SYSTEM | refund accepted at Stripe: {stripe_refund['refund_id']} "
+        f"({mode}, attempt {info.attempt})"
     )
-
-    # Demo-only restart window (EFFECT_RESTART_WINDOW_SECONDS, 0 by default). The
-    # retry drill (stage --simulate-stripe-retry) and the manual walkthrough in
-    # docs/GUIDE.md set it, so a kill can land after Stripe accepts the refund
-    # but before Temporal records it. A real Activity returns right away.
-    restart_window = effect_restart_window_seconds()
-    if info.attempt == 1 and restart_window > 0:
-        _line(
-            "EXECUTION STATE",
-            f"restart window open {restart_window:.0f}s; run: refund-demo kill-worker",
-        )
-        # This pause is intentionally after the effect and before completion.
-        # Heartbeats keep attempt 1 alive until the process is actually killed.
-        deadline = time.monotonic() + restart_window
-        while time.monotonic() < deadline:
-            activity.heartbeat("effect accepted, result not reported")
-            time.sleep(min(1.0, max(0.0, deadline - time.monotonic())))
-
-    if request.hold_after_effect and info.attempt == 1:
-        # Demo-only cue for the manual walkthrough (refund-demo start --hold).
-        # This only prints the next steps; the wait itself is in the Workflow,
-        # after this result is recorded. Kill and restart the Worker then;
-        # replay sees this step already done and does not repeat it. Then
-        # send `release`.
-        _line(
-            "EXECUTION STATE",
-            "refund recorded; holding for release. kill-worker now, restart, "
-            f"then: refund-demo release {workflow_id}",
-        )
-
     return RefundResult(
-        refund_id=str(effect["refund_id"]),
-        status=str(effect["status"]),
-        amount_cents=int(effect["amount_cents"]),
+        refund_id=str(stripe_refund["refund_id"]),
+        status=str(stripe_refund["status"]),
+        amount_cents=int(str(stripe_refund["amount_cents"])),
         idempotency_key=idempotency_key,
         activity_attempt=info.attempt,
         mode=mode,

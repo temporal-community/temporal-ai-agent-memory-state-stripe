@@ -5,7 +5,7 @@ import concurrent.futures
 import logging
 import os
 
-from temporalio import workflow
+from temporalio import activity, workflow
 from temporalio.client import Client
 from temporalio.worker import Worker
 
@@ -16,8 +16,9 @@ from refund_agent.activities import (
     lookup_customer_history,
     lookup_order,
     remember_case,
-    show_empty_agent_view,
+    search_memory,
 )
+from refund_agent.demo_hooks import interceptors_from_env
 from refund_agent.settings import (
     load_env_file,
     task_queue,
@@ -36,6 +37,7 @@ async def run_worker() -> None:
     # Stage legibility: keep the EXECUTION STATE lines clean by not appending
     # the workflow info dict (run id, attempt, task queue) to every log message.
     workflow.logger.workflow_info_on_message = False
+    activity.logger.activity_info_on_message = False
     validate_stripe_key(os.getenv("STRIPE_API_KEY"), required=False)
 
     # Demo-only PID file: `refund-demo kill-worker` reads it to SIGKILL this
@@ -43,7 +45,9 @@ async def run_worker() -> None:
     pid_path = worker_pid_file()
     pid_path.parent.mkdir(parents=True, exist_ok=True)
     pid_path.write_text(f"{os.getpid()}\n", encoding="utf-8")
-    show_empty_agent_view()
+    # Demo-only hooks (demo_hooks.py): the stage's pause and failure drills,
+    # applied at the Worker edge. Empty unless a hook setting is on.
+    interceptors = interceptors_from_env()
     print(
         "EXECUTION STATE | Worker connected to "
         f"{temporal_address()} on task queue {task_queue()}",
@@ -70,10 +74,12 @@ async def run_worker() -> None:
                     lookup_order,
                     lookup_customer_history,
                     check_refund_policy,
+                    search_memory,
                     issue_refund,
                     remember_case,
                 ],
                 activity_executor=executor,
+                interceptors=interceptors,
             )
             await worker.run()
     finally:

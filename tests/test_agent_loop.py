@@ -15,15 +15,20 @@ from temporalio.exceptions import ApplicationError
 from refund_agent.activities import (
     STRIPE_TIMEOUT_SECONDS,
     TOOL_HISTORY,
+    TOOL_MEMORY,
     TOOL_ORDER,
     TOOL_POLICY,
-    _canned_step,
     check_refund_policy,
+    fixed_policy_step,
     lookup_customer_history,
     lookup_order,
+    search_memory,
 )
+from refund_agent.agent_loop import run_agent_loop
 from refund_agent.models import (
+    OFFLINE_POLICY,
     AgentStep,
+    CaseMemory,
     CustomerHistory,
     OrderDetails,
     RefundDecision,
@@ -31,7 +36,11 @@ from refund_agent.models import (
     RefundResult,
     ReturnStatus,
 )
-from refund_agent.workflow import RefundWorkflow, refund_activity_timeouts
+from refund_agent.workflow import (
+    REFUND_HEARTBEAT_TIMEOUT,
+    REFUND_START_TO_CLOSE_TIMEOUT,
+    RefundWorkflow,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -53,66 +62,182 @@ def _request(amount_cents: int) -> RefundRequest:
     )
 
 
-def _drive_canned(request: RefundRequest, max_turns: int = 10):
-    working_memory: list[dict] = []
+def _lookup(request: RefundRequest, tool: str) -> dict:
+    if tool == TOOL_ORDER:
+        return asdict(lookup_order(request.order_id))
+    if tool == TOOL_HISTORY:
+        return asdict(lookup_customer_history(request.customer_id))
+    if tool == TOOL_POLICY:
+        return asdict(check_refund_policy(request.order_id))
+    if tool == TOOL_MEMORY:
+        return asdict(search_memory(request.customer_id))
+    raise AssertionError(f"unknown tool {tool}")
+
+
+def _run_loop(request: RefundRequest, steps=None, answers=None):
+    """Run the shared agent loop with direct calls, as Demo 1 does.
+
+    steps scripts the model's turns; by default the fixed policy decides.
+    Returns (decision, working memory, tools used, questions asked).
+    """
+
+    scripted = iter(steps or [])
     tools_used: list[str] = []
-    for _ in range(max_turns):
-        step = _canned_step(request, working_memory)
-        if step.action == "decide":
-            return step.recommendation, tools_used
-        if step.action == "ask_customer":
-            working_memory.append(
-                {
-                    "tool": "customer_answer",
-                    "result": {
-                        "question_id": step.question_id,
-                        "answer": step.suggested_answer,
-                    },
-                }
-            )
-            continue
-        tools_used.append(step.tool)
-        if step.tool == TOOL_ORDER:
-            result = lookup_order(request.order_id)
-        elif step.tool == TOOL_HISTORY:
-            result = lookup_customer_history(request.customer_id)
-        elif step.tool == TOOL_POLICY:
-            result = check_refund_policy(request.order_id)
-        else:
-            raise AssertionError(f"unknown tool {step.tool}")
-        working_memory.append({"tool": step.tool, "result": asdict(result)})
-    raise AssertionError("canned policy did not decide within the turn budget")
+    asked: list[str] = []
+
+    async def decide(request: RefundRequest, working_memory: list[dict]) -> AgentStep:
+        if steps is None:
+            return fixed_policy_step(request, working_memory)
+        return next(scripted)
+
+    async def use_tool(tool: str) -> dict:
+        tools_used.append(tool)
+        return _lookup(request, tool)
+
+    async def ask_customer(step: AgentStep) -> str:
+        asked.append(str(step.question_id))
+        return (answers or {}).get(str(step.question_id), step.suggested_answer or "")
+
+    working_memory: list[dict] = []
+    decision = asyncio.run(
+        run_agent_loop(
+            request,
+            working_memory,
+            decide=decide,
+            use_tool=use_tool,
+            ask_customer=ask_customer,
+        )
+    )
+    return decision, working_memory, tools_used, asked
 
 
 def test_canned_clean_refund_auto_approves() -> None:
-    recommendation, tools = _drive_canned(_request(8000))
-    assert recommendation == "approve"
-    assert tools == [TOOL_ORDER, TOOL_HISTORY]
+    decision, _, tools, asked = _run_loop(_request(8000))
+    assert decision.recommendation == "approve"
+    assert tools == [TOOL_ORDER, TOOL_HISTORY, TOOL_MEMORY]
+    # The request already carried the intake answers, so nothing was asked.
+    assert asked == []
 
 
-def test_interactive_agent_asks_each_question_before_using_tools() -> None:
-    request = RefundRequest(**{**asdict(_request(8000)), "interactive_questions": True})
-    working_memory: list[dict] = []
+def test_fixed_policy_asks_each_missing_question_before_using_tools() -> None:
+    request = replace(_request(8000), item_opened=None, damage=None)
 
-    opened = _canned_step(request, working_memory)
-    assert opened.action == "ask_customer"
-    assert opened.question_id == "item_opened"
-    working_memory.append(
-        {
-            "tool": "customer_answer",
-            "result": {"question_id": "item_opened", "answer": "Yes"},
-        }
+    decision, working_memory, tools, asked = _run_loop(
+        request, answers={"damage": "torn wing"}
     )
 
-    damage = _canned_step(request, working_memory)
-    assert damage.action == "ask_customer"
-    assert damage.question_id == "damage"
+    assert asked == ["item_opened", "damage"]
+    assert tools == [TOOL_ORDER, TOOL_HISTORY, TOOL_MEMORY]
+    assert decision.recommendation == "approve"
+    answers = [obs for obs in working_memory if obs["tool"] == "customer_answer"]
+    assert [obs["result"]["answer"] for obs in answers] == ["Yes", "torn wing"]
+
+
+def test_fixed_policy_asks_only_for_what_the_request_lacks() -> None:
+    request = replace(_request(8000), damage=None)
+
+    _, _, _, asked = _run_loop(request)
+
+    assert asked == ["damage"]
 
 
 def test_canned_large_refund_escalates() -> None:
-    recommendation, tools = _drive_canned(_request(15000))
-    assert recommendation == "escalate"
+    decision, _, tools, _ = _run_loop(_request(15000))
+    assert decision.recommendation == "escalate"
     assert TOOL_POLICY in tools
+
+
+def test_history_holds_one_entry_per_model_turn() -> None:
+    request = replace(_request(8000), item_opened=None, damage=None)
+
+    _, working_memory, _, _ = _run_loop(request)
+
+    assert [obs["tool"] for obs in working_memory] == [
+        "agent_step",
+        "customer_answer",
+        "agent_step",
+        "customer_answer",
+        "agent_step",
+        TOOL_ORDER,
+        "agent_step",
+        TOOL_HISTORY,
+        "agent_step",
+        TOOL_MEMORY,
+        "agent_step",
+    ]
+    turns = [obs for obs in working_memory if obs["tool"] == "agent_step"]
+    assert turns[0] == {
+        "tool": "agent_step",
+        "action": "ask_customer",
+        "question_id": "item_opened",
+        "rationale": "",
+    }
+    assert turns[2]["tool_chosen"] == TOOL_ORDER
+    assert turns[-1]["action"] == "decide"
+    assert turns[-1]["recommendation"] == "approve"
+    assert turns[-1]["rationale"]
+
+
+def _ask(question_id: str) -> AgentStep:
+    return AgentStep(
+        action="ask_customer",
+        question_id=question_id,
+        question=f"{question_id}?",
+        suggested_answer="suggested",
+    )
+
+
+_DECIDE = AgentStep(action="decide", recommendation="approve", rationale="ok")
+
+
+@pytest.mark.parametrize(
+    "questions",
+    [
+        [],  # a live model may decide without asking
+        ["damage"],
+        ["damage", "item_opened"],  # any order
+        ["item_opened", "item_opened"],  # a repeat reuses the first answer
+    ],
+)
+def test_loop_accepts_any_number_and_order_of_questions(questions) -> None:
+    steps = [_ask(question_id) for question_id in questions] + [_DECIDE]
+
+    decision, working_memory, _, asked = _run_loop(_request(8000), steps=steps)
+
+    assert decision.recommendation == "approve"
+    assert asked == list(dict.fromkeys(questions))
+    answered = [
+        obs["result"]["question_id"]
+        for obs in working_memory
+        if obs["tool"] == "customer_answer"
+    ]
+    assert answered == questions
+
+
+@pytest.mark.parametrize(
+    ("step", "error_type"),
+    [
+        (_ask("refund_destination"), "UnknownCustomerQuestion"),
+        (AgentStep(action="use_tool", tool="issue_refund"), "UnknownTool"),
+    ],
+)
+def test_loop_rejects_unknown_questions_and_tools(step, error_type) -> None:
+    with pytest.raises(ApplicationError) as error:
+        _run_loop(_request(8000), steps=[step])
+
+    assert error.value.type == error_type
+    assert error.value.non_retryable
+
+
+def test_loop_stops_at_the_turn_budget() -> None:
+    from refund_agent.agent_loop import MAX_TURNS
+
+    steps = [AgentStep(action="use_tool", tool=TOOL_ORDER)] * MAX_TURNS
+
+    with pytest.raises(ApplicationError) as error:
+        _run_loop(_request(8000), steps=steps)
+
+    assert error.value.type == "AgentLoopExhausted"
 
 
 def test_stage_refund_policy_is_explicitly_eligible_without_a_return() -> None:
@@ -164,6 +289,8 @@ def test_openai_step_maps_tool_and_decision(monkeypatch) -> None:
     step = model._openai_step(request, [], "key")
     assert step.action == "use_tool"
     assert step.tool == "lookup_order"
+    # Lookups take no arguments: the model's arguments are not copied in.
+    assert not hasattr(step, "tool_args")
 
     monkeypatch.setattr(
         model,
@@ -373,21 +500,46 @@ def test_model_prompts_show_money_as_dollars_not_cents(monkeypatch) -> None:
     assert working_memory[0]["result"]["amount_cents"] == 8000
 
 
-def test_intake_questions_stay_code_driven_on_the_live_model(monkeypatch) -> None:
+def test_the_live_model_chooses_its_own_intake_questions(monkeypatch) -> None:
     from refund_agent.activities import model
 
-    def no_model(**_kwargs):
-        raise AssertionError("an intake question must not call the model")
-
+    monkeypatch.delenv("LOG_MODEL_USAGE", raising=False)
     monkeypatch.setenv("OPENAI_API_KEY", "key")
-    monkeypatch.setattr(model, "OpenAI", no_model)
+    monkeypatch.setenv("OPENAI_MODEL", "test-model")
+    sent: list[dict] = []
+    monkeypatch.setattr(
+        model,
+        "OpenAI",
+        lambda **_kw: SimpleNamespace(responses=_RecordingResponses(sent)),
+    )
     request = replace(
-        _request(8000), interactive_questions=True, model_provider="openai"
+        _request(8000), item_opened=None, damage=None, model_provider="openai"
     )
 
-    step = model.decide_next_step(request, [])
+    # No scripted question comes first: turn one already goes to the model.
+    step = model.model_next_step(request, [])
 
-    assert (step.action, step.question_id) == ("ask_customer", "item_opened")
+    assert step.tool == "lookup_order"
+    assert len(sent) == 1
+    assert "use ask_customer to collect it" in sent[0]["instructions"]
+    payload = json.loads(sent[0]["input"])
+    assert payload["request"]["item_opened"] is None
+    # Routing fields stay out of the prompt.
+    assert "model_provider" not in payload["request"]
+    assert "dry_run" not in payload["request"]
+
+
+def test_the_model_step_never_falls_back_to_the_offline_policy(monkeypatch) -> None:
+    from refund_agent.activities import model
+
+    for name in ("AGENT_MODEL_PROVIDER", "OPENAI_API_KEY", "ANTHROPIC_API_KEY"):
+        monkeypatch.delenv(name, raising=False)
+
+    with pytest.raises(ApplicationError) as error:
+        model.model_next_step(_request(8000), [])
+
+    assert error.value.type == "ModelKeyMissing"
+    assert "--offline" in str(error.value)
 
 
 def test_the_activity_keeps_its_name_and_runs_the_shared_decision(
@@ -398,32 +550,39 @@ def test_the_activity_keeps_its_name_and_runs_the_shared_decision(
     from refund_agent.activities import model
 
     monkeypatch.setenv("DEMO_STATE_DIR", str(tmp_path))
-    request = replace(_request(8000), use_canned_agent=True)
+    request = replace(_request(8000), model_provider=OFFLINE_POLICY)
     working_memory = [
         {"tool": TOOL_ORDER, "result": asdict(lookup_order(request.order_id))},
         {
             "tool": TOOL_HISTORY,
             "result": asdict(lookup_customer_history(request.customer_id)),
         },
+        {"tool": TOOL_MEMORY, "result": asdict(search_memory(request.customer_id))},
     ]
-    shared: list[tuple] = []
-    original = model.decide_next_step
+    calls: list[tuple] = []
 
-    def recording_decide(*args, **kwargs):
-        shared.append(args)
-        return original(*args, **kwargs)
+    def recording_model_step(*args, **_kwargs):
+        calls.append(args)
+        return AgentStep(action="decide", recommendation="deny", source="model")
 
-    monkeypatch.setattr(model, "decide_next_step", recording_decide)
+    monkeypatch.setattr(model, "model_next_step", recording_model_step)
 
+    # Offline is an explicit choice in the request: the fixed policy, no model.
     step = ActivityEnvironment().run(
         model.agent_decide_next_step, request, working_memory
     )
 
     definition = activity._Definition.must_from_callable(model.agent_decide_next_step)
     assert definition.name == "agent_decide_next_step"
-    assert shared == [(request, working_memory)]
-    assert step == _canned_step(request, working_memory)
+    assert calls == []
+    assert step == fixed_policy_step(request, working_memory)
     assert step.recommendation == "approve"
+
+    # Any other provider goes to the shared model step.
+    live = replace(request, model_provider="openai")
+    step = ActivityEnvironment().run(model.agent_decide_next_step, live, working_memory)
+    assert calls == [(live, working_memory)]
+    assert step.source == "model"
 
 
 # ---------------------------------------------------------------------------
@@ -694,33 +853,18 @@ def test_usage_command_reports_demo_one_and_demo_two_apart(
 
 
 # ---------------------------------------------------------------------------
-# EFFECT: issue_refund timeouts, Stripe failures, and the final phase.
+# REFUND: issue_refund timeouts, Stripe failures, and the final phase.
 # ---------------------------------------------------------------------------
 
 _STRIPE_WORST_CASE = timedelta(seconds=sum(STRIPE_TIMEOUT_SECONDS))
 
 
-@pytest.mark.parametrize(
-    ("changes", "heartbeat_seconds"),
-    [
-        ({}, 15),
-        ({"fast_recovery": True}, 15),  # the main stage take
-        ({"fast_recovery": True, "simulate_stripe_timeout": True}, 3),
-        ({"fast_recovery": True, "simulate_stripe_retry": True}, 3),
-        ({"simulate_stripe_retry": True}, 15),
-    ],
-)
-def test_short_heartbeat_only_where_the_stage_kills_the_worker_mid_refund(
-    changes, heartbeat_seconds
-) -> None:
-    request = replace(_request(8000), dry_run=False, **changes)
-
-    heartbeat, start_to_close = refund_activity_timeouts(request)
-
-    assert heartbeat == timedelta(seconds=heartbeat_seconds)
-    # One attempt outlasts the Stripe client timeout, so Stripe's own timeout
-    # reports a hung call before Temporal ends the attempt.
-    assert start_to_close > _STRIPE_WORST_CASE
+def test_refund_timeouts_detect_a_lost_worker_before_stripe_gives_up() -> None:
+    # issue_refund heartbeats every second, so a few missed beats mean the
+    # Worker is gone. One attempt outlasts the Stripe client timeout, so
+    # Stripe's own timeout reports a hung call before Temporal ends the attempt.
+    assert timedelta(seconds=1) < REFUND_HEARTBEAT_TIMEOUT < _STRIPE_WORST_CASE
+    assert REFUND_START_TO_CLOSE_TIMEOUT > _STRIPE_WORST_CASE
 
 
 def test_real_refund_call_is_bounded_and_leaves_retries_to_temporal(
@@ -740,9 +884,9 @@ def test_real_refund_call_is_bounded_and_leaves_retries_to_temporal(
 
     monkeypatch.setattr(stripe.Refund, "create", fake_create)
 
-    effect = refund._real_stripe_refund(_request(8000), "wf", "key-1")
+    stripe_refund = refund._real_stripe_refund(_request(8000), "wf", "key-1")
 
-    assert effect == {
+    assert stripe_refund == {
         "refund_id": "re_test",
         "status": "succeeded",
         "amount_cents": 8000,
@@ -797,7 +941,7 @@ def test_issue_refund_retries_only_transient_stripe_failures(
     from refund_agent.activities import refund
 
     monkeypatch.setenv("DEMO_STATE_DIR", str(tmp_path))
-    monkeypatch.delenv("EFFECT_RESTART_WINDOW_SECONDS", raising=False)
+    monkeypatch.delenv("REFUND_RESTART_WINDOW_SECONDS", raising=False)
 
     def failing_refund(*_args):
         raise error
@@ -810,7 +954,6 @@ def test_issue_refund_retries_only_transient_stripe_failures(
             refund.issue_refund,
             replace(_request(8000), dry_run=False),
             decision,
-            [],
         )
 
     assert raised.value.non_retryable is not retryable
@@ -823,7 +966,7 @@ def _run_real_refund(monkeypatch, tmp_path, fake_refund, on_heartbeat=None):
     from refund_agent.activities import refund
 
     monkeypatch.setenv("DEMO_STATE_DIR", str(tmp_path))
-    monkeypatch.delenv("EFFECT_RESTART_WINDOW_SECONDS", raising=False)
+    monkeypatch.delenv("REFUND_RESTART_WINDOW_SECONDS", raising=False)
     monkeypatch.setattr(refund, "_real_stripe_refund", fake_refund)
     environment = ActivityEnvironment()
     if on_heartbeat is not None:
@@ -832,7 +975,6 @@ def _run_real_refund(monkeypatch, tmp_path, fake_refund, on_heartbeat=None):
         refund.issue_refund,
         replace(_request(8000), dry_run=False),
         RefundDecision(recommendation="approve", rationale="", source="test"),
-        [],
     )
 
 
@@ -855,6 +997,33 @@ def test_retryable_stripe_error_carries_retry_after(
     assert raised.value.next_retry_delay == expected
 
 
+def test_idempotency_key_follows_the_workflow_id_not_the_run(
+    tmp_path, monkeypatch
+) -> None:
+    # One refund request is one Workflow ID. A reset or a new run of that
+    # Workflow ID gets a new Run ID but must send Stripe the same key.
+    from temporalio.testing import ActivityEnvironment
+
+    from refund_agent.activities import refund
+    from refund_agent.fake_stripe import idempotency_key_for
+
+    monkeypatch.setenv("DEMO_STATE_DIR", str(tmp_path))
+    keys = []
+    for run_id in ("run-a", "run-b"):
+        environment = ActivityEnvironment()
+        environment.info = replace(
+            environment.info, workflow_id="refund-42", workflow_run_id=run_id
+        )
+        result = environment.run(
+            refund.issue_refund,
+            _request(8000),
+            RefundDecision(recommendation="approve", rationale="", source="test"),
+        )
+        keys.append(result.idempotency_key)
+
+    assert keys == [idempotency_key_for("refund-42")] * 2
+
+
 def test_issue_refund_heartbeats_while_stripe_is_slow(tmp_path, monkeypatch) -> None:
     heartbeats: list[tuple] = []
 
@@ -874,28 +1043,26 @@ def test_issue_refund_heartbeats_while_stripe_is_slow(tmp_path, monkeypatch) -> 
     assert heartbeats
 
 
-async def _wait_for_phase(handle, phase: str) -> None:
+async def _wait_for_phase(handle, phase: str) -> dict:
     deadline = time.monotonic() + 15
     seen = None
     while time.monotonic() < deadline:
-        seen = (await handle.query(RefundWorkflow.stage_progress))["phase"]
+        progress = await handle.query(RefundWorkflow.progress)
+        seen = progress["phase"]
         if seen == phase:
-            return
+            return progress
         await asyncio.sleep(0.05)
     raise AssertionError(f"phase stayed {seen!r}; expected {phase!r}")
 
 
-async def _check_refund_phases(temporal: str) -> None:
-    from temporalio.testing import WorkflowEnvironment
-    from temporalio.worker import Worker
-
-    refund_may_return = asyncio.Event()
+def _fake_activities(refund_may_return: asyncio.Event):
+    """Stand-ins for the seven Activities, registered under their real names."""
 
     @activity.defn(name="agent_decide_next_step")
     async def decide(request: RefundRequest, working_memory: list[dict]) -> AgentStep:
         if request.customer_id == "uses-every-tool":
             done = {observation["tool"] for observation in working_memory}
-            for tool in (TOOL_ORDER, TOOL_HISTORY, TOOL_POLICY):
+            for tool in (TOOL_ORDER, TOOL_HISTORY, TOOL_POLICY, TOOL_MEMORY):
                 if tool not in done:
                     return AgentStep(action="use_tool", tool=tool)
         return AgentStep(action="decide", recommendation="approve", rationale="")
@@ -912,26 +1079,34 @@ async def _check_refund_phases(temporal: str) -> None:
     async def policy(order_id: str) -> ReturnStatus:
         return ReturnStatus(order_id, True, False, False, False, "eligible")
 
+    @activity.defn(name="search_memory")
+    async def memory(customer_id: str) -> CaseMemory:
+        return CaseMemory(customer_id, [])
+
     @activity.defn(name="remember_case")
     async def remember(customer_id: str, case_id: str, note: str) -> bool:
         return True
 
     @activity.defn(name="issue_refund")
-    async def refund(
-        request: RefundRequest,
-        decision: RefundDecision,
-        working_memory: list[dict],
-    ) -> RefundResult:
+    async def refund(request: RefundRequest, decision: RefundDecision) -> RefundResult:
         await refund_may_return.wait()
         return RefundResult(
             refund_id="re_test",
             status="succeeded",
             amount_cents=request.amount_cents,
             idempotency_key="key",
-            activity_attempt=1,
+            activity_attempt=activity.info().attempt,
             mode="dry-run",
         )
 
+    return [decide, order, history, policy, memory, refund, remember]
+
+
+async def _check_refund_phases(temporal: str) -> None:
+    from temporalio.testing import WorkflowEnvironment
+    from temporalio.worker import Worker
+
+    refund_may_return = asyncio.Event()
     async with await WorkflowEnvironment.start_local(
         dev_server_existing_path=temporal
     ) as env:
@@ -940,29 +1115,22 @@ async def _check_refund_phases(temporal: str) -> None:
             env.client,
             task_queue=queue,
             workflows=[RefundWorkflow],
-            activities=[decide, order, history, policy, refund, remember],
+            activities=_fake_activities(refund_may_return),
         ):
-            held = await env.client.start_workflow(
-                RefundWorkflow.run,
-                replace(_request(8000), hold_after_effect=True),
-                id=f"held-{queue}",
-                task_queue=queue,
-            )
-            await _wait_for_phase(held, "issuing_refund")
-            refund_may_return.set()
-            await _wait_for_phase(held, "holding_after_effect")
-            await held.signal(RefundWorkflow.release)
-            assert (await held.result()).refund_id == "re_test"
-            await _wait_for_phase(held, "completed")
-
             plain = await env.client.start_workflow(
                 RefundWorkflow.run,
                 _request(8000),
                 id=f"plain-{queue}",
                 task_queue=queue,
             )
+            progress = await _wait_for_phase(plain, "issuing_refund")
+            # The progress Query carries what the stage and watch view show.
+            assert progress["decision"]["recommendation"] == "approve"
+            assert progress["request"]["order_id"] == "order-1234"
+            assert progress["working_memory"][-1]["tool"] == "agent_step"
+            refund_may_return.set()
             await plain.result()
-            assert await plain.query(RefundWorkflow.stage_phase) == "completed"
+            await _wait_for_phase(plain, "completed")
             history = await plain.fetch_history()
             [scheduled] = [
                 event.activity_task_scheduled_event_attributes
@@ -971,7 +1139,7 @@ async def _check_refund_phases(temporal: str) -> None:
                 and event.activity_task_scheduled_event_attributes.activity_type.name
                 == "issue_refund"
             ]
-            assert scheduled.heartbeat_timeout.ToTimedelta() == timedelta(seconds=15)
+            assert scheduled.heartbeat_timeout.ToTimedelta() == REFUND_HEARTBEAT_TIMEOUT
             # The names a viewer reads in Event History match the code on screen.
             [turn] = [
                 event
@@ -1003,22 +1171,154 @@ async def _check_refund_phases(temporal: str) -> None:
                 if event.HasField("activity_task_scheduled_event_attributes")
             }
             assert summaries == {
-                "agent_decide_next_step": "Agent turn 4: decide the next step",
+                "agent_decide_next_step": "Agent turn 5: decide the next step",
                 "lookup_order": "Look up order 1234",
                 "lookup_customer_history": "Look up the customer's refund history",
                 "check_refund_policy": "Check the refund policy",
+                "search_memory": "Recall past cases from long-term memory",
                 "issue_refund": "Issue the refund in Stripe",
                 "remember_case": "Save a case note to long-term memory",
             }
 
 
-def test_stage_progress_reports_completed_after_the_refund() -> None:
+def test_progress_query_follows_the_run_to_completion() -> None:
     # A real local dev server on a free port, from the temporal CLI on PATH.
     # Nothing is downloaded, and no other Temporal server is touched.
     temporal = shutil.which("temporal")
     if temporal is None:
         pytest.skip("needs the temporal CLI on PATH")
     asyncio.run(_check_refund_phases(temporal))
+
+
+async def _check_stage_hold_and_new_worker(temporal: str) -> None:
+    from temporalio.testing import WorkflowEnvironment
+    from temporalio.worker import Worker
+
+    from refund_agent.demo_hooks import DemoHooks, DemoHooksInterceptor
+    from refund_agent.settings import refund_hold_marker
+
+    refund_may_return = asyncio.Event()
+    refund_may_return.set()
+    async with await WorkflowEnvironment.start_local(
+        dev_server_existing_path=temporal
+    ) as env:
+        queue = f"hook-test-{uuid.uuid4().hex[:8]}"
+        # The stage's first Worker: the hook holds the refund before it runs.
+        held_worker = Worker(
+            env.client,
+            task_queue=queue,
+            workflows=[RefundWorkflow],
+            activities=_fake_activities(refund_may_return),
+            interceptors=[DemoHooksInterceptor(DemoHooks(hold_refund=True))],
+        )
+        async with held_worker:
+            handle = await env.client.start_workflow(
+                RefundWorkflow.run,
+                _request(8000),
+                id=f"hook-{queue}",
+                task_queue=queue,
+            )
+            deadline = time.monotonic() + 15
+            while not refund_hold_marker().exists():
+                assert time.monotonic() < deadline, "the hook never held the refund"
+                await asyncio.sleep(0.05)
+            progress = await handle.query(RefundWorkflow.progress)
+            assert progress["phase"] == "issuing_refund"
+        # The held Worker is gone (shut down here; SIGKILL on stage). A plain
+        # Worker picks up the next attempt and finishes the run.
+        async with Worker(
+            env.client,
+            task_queue=queue,
+            workflows=[RefundWorkflow],
+            activities=_fake_activities(refund_may_return),
+        ):
+            result = await asyncio.wait_for(handle.result(), timeout=30)
+        assert result.refund_id == "re_test"
+        assert result.activity_attempt == 2
+
+
+def test_stage_hook_holds_the_refund_until_a_new_worker_takes_over() -> None:
+    temporal = shutil.which("temporal")
+    if temporal is None:
+        pytest.skip("needs the temporal CLI on PATH")
+    asyncio.run(_check_stage_hold_and_new_worker(temporal))
+
+
+async def _check_offline_run_with_real_activities(temporal: str) -> None:
+    import concurrent.futures
+
+    from temporalio.testing import WorkflowEnvironment
+    from temporalio.worker import Worker
+
+    from refund_agent.activities import (
+        agent_decide_next_step,
+        issue_refund,
+        remember_case,
+    )
+    from refund_agent.fake_stripe import find_refund
+
+    async with await WorkflowEnvironment.start_local(
+        dev_server_existing_path=temporal
+    ) as env:
+        queue = f"offline-test-{uuid.uuid4().hex[:8]}"
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+            async with Worker(
+                env.client,
+                task_queue=queue,
+                workflows=[RefundWorkflow],
+                activities=[
+                    agent_decide_next_step,
+                    lookup_order,
+                    lookup_customer_history,
+                    check_refund_policy,
+                    search_memory,
+                    issue_refund,
+                    remember_case,
+                ],
+                activity_executor=executor,
+            ):
+                request = replace(
+                    _request(8000),
+                    item_opened=None,
+                    damage=None,
+                    model_provider=OFFLINE_POLICY,
+                )
+                handle = await env.client.start_workflow(
+                    RefundWorkflow.run,
+                    request,
+                    id=f"offline-{queue}",
+                    task_queue=queue,
+                )
+                # Answers can arrive before the questions; the loop uses them.
+                await handle.signal(
+                    RefundWorkflow.customer_answer, args=["damage", "torn wing"]
+                )
+                await handle.signal(
+                    RefundWorkflow.customer_answer, args=["item_opened", "Yes"]
+                )
+                result = await asyncio.wait_for(handle.result(), timeout=30)
+                progress = await handle.query(RefundWorkflow.progress)
+
+    assert (result.status, result.mode, result.activity_attempt) == (
+        "succeeded",
+        "dry-run",
+        1,
+    )
+    assert find_refund(f"offline-{queue}")["calls"] == 1
+    answers = [
+        obs["result"]["answer"]
+        for obs in progress["working_memory"]
+        if obs["tool"] == "customer_answer"
+    ]
+    assert answers == ["Yes", "torn wing"]
+
+
+def test_offline_run_completes_with_the_real_activities() -> None:
+    # The real Activities on a real Worker, so their argument types decode.
+    temporal = shutil.which("temporal")
+    if temporal is None:
+        pytest.skip("needs the temporal CLI on PATH")
+    asyncio.run(_check_offline_run_with_real_activities(temporal))
 
 
 def test_lookups_read_the_demo_store() -> None:
@@ -1031,7 +1331,7 @@ def test_lookups_read_the_demo_store() -> None:
     history = lookup_customer_history("cus_demo_42")
     assert history.account_tenure_days == 824
     assert len(history.prior_refunds) == 1
-    assert history.past_cases == []
+    assert search_memory("cus_demo_42").past_cases == []
     assert check_refund_policy("order-1234").return_required is False
 
 
@@ -1041,23 +1341,27 @@ def test_lookup_of_an_unknown_order_fails_without_retrying() -> None:
     assert error.value.non_retryable
 
 
-def test_case_notes_are_saved_once_and_read_back_as_past_cases() -> None:
+def test_case_notes_are_saved_once_and_recalled_apart_from_the_records() -> None:
     from refund_agent.activities import remember_case
 
     assert remember_case("cus_demo_42", "wf-1", "refund succeeded") is True
     # A retried write with the same case ID saves nothing new.
     assert remember_case("cus_demo_42", "wf-1", "refund succeeded") is False
     assert remember_case("cus_demo_42", "wf-2", "second case") is True
-    history = lookup_customer_history("cus_demo_42")
-    assert history.past_cases == ["second case", "refund succeeded"]
-    # Notes are memory, not refunds: the prior-refund count is unchanged.
-    assert len(history.prior_refunds) == 1
+    assert search_memory("cus_demo_42").past_cases == [
+        "second case",
+        "refund succeeded",
+    ]
+    # Memory never comes back through a record lookup, and notes are not refunds.
+    history = asdict(lookup_customer_history("cus_demo_42"))
+    assert "past_cases" not in history
+    assert len(history["prior_refunds"]) == 1
 
 
 def test_lookup_tools_take_no_ids_from_the_model() -> None:
     from refund_agent.activities.model import _TOOL_SCHEMAS
 
-    lookups = {TOOL_ORDER, TOOL_HISTORY, TOOL_POLICY}
+    lookups = {TOOL_ORDER, TOOL_HISTORY, TOOL_POLICY, TOOL_MEMORY}
     for schema in _TOOL_SCHEMAS:
         if schema["name"] in lookups:
             assert schema["parameters"]["properties"] == {}

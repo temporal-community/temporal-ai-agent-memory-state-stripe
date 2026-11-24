@@ -24,8 +24,8 @@ The audience leaves with three ideas:
    work stood.
 3. Temporal records where the work stands in Event History, so a new Worker
    can rebuild the completed steps and the next action. Every refund attempt
-   sends the same idempotency key, built from the Workflow ID and Run ID, so
-   Stripe makes one refund.
+   sends the same idempotency key, built from the Workflow ID, so Stripe makes
+   one refund.
 
 ## Before you start
 
@@ -34,7 +34,7 @@ The audience leaves with three ideas:
 
   | Take | Command | Needs |
   | --- | --- | --- |
-  | Offline, no keys | `make run` | uv and the Temporal CLI |
+  | Offline, no keys | `make run-offline` | uv and the Temporal CLI |
   | Stripe test mode | `uv run refund-demo stage --real` | A Stripe `sk_test_` or `rk_test_` key |
   | Live model and Stripe test mode (what the video ran) | `uv run refund-demo stage --real --real-model --model-provider openai` (or `anthropic`) | The model keys in [Keys and live paths](../README.md#keys-and-live-paths) |
 
@@ -76,8 +76,10 @@ The audience leaves with three ideas:
 3. Enter through the two prefilled answers:
    - `Was the package opened? [Yes]`
    - `What was damaged? [Split seam]`
-4. The lookups land with `(memory)` tags, then `→ Next: issue refund`. The
-   bottom panel says `Next step: submit the refund.`
+4. The lookups land: the order and refund history from the records, then
+   `Past cases (memory): none yet` from long-term memory, then
+   `→ Next: issue refund`. The bottom panel says `Next step: submit the
+   refund.`
 5. Enter at `Press Enter to submit the refund`.
    - `PROCESS GONE` appears with "The demo stops the process here, before the
      refund reaches Stripe."
@@ -85,7 +87,8 @@ The audience leaves with three ideas:
    - `WHAT'S LEFT` is Stripe's record: paid, no refund.
 6. Enter at `Press Enter to start a new agent process`.
 7. Enter at `Ask the new process: What happened to my refund?`.
-8. The agent checks Stripe and says to start the return again under
+8. The agent finds no past cases in memory (the process died before it saved
+   one), checks Stripe, and says to start the return again under
    `THE CUSTOMER STARTS OVER`.
 
 **Land:**
@@ -129,7 +132,7 @@ Talk from the quick hits on each slide.
   - **State:** the facts the model doesn't own. Here it splits in two:
     - **Execution state:** where the work stands. Temporal records it in
       Event History.
-    - **Effect state:** whether the refund happened. Stripe owns that.
+    - **The refund itself:** whether it happened. Stripe owns that.
 - Facts have owners. When memory and the record disagree, the record wins.
 - Workflow code runs in the Worker.
 - The Temporal Service records each step in Event History.
@@ -154,7 +157,7 @@ Talk from the quick hits on each slide.
    spinner says it is reusing your Demo 1 answers.
 3. The right pane, `Saved so far:`, shows:
    - 2 customer answers
-   - 2 completed lookups
+   - 3 completed lookups (the third is past cases from memory: `none yet`)
    - `Next action: issue refund`
    - `(demo pauses here, before Stripe)`
 4. Enter at `Press Enter to submit the refund`.
@@ -165,8 +168,11 @@ Talk from the quick hits on each slide.
    - Hold it for 3 seconds.
 5. Enter at `Press Enter to start a new Worker`.
    - `NEW TEMPORAL WORKER` shows `NO REPEATED QUESTIONS`, `NO LOOP RESTART`,
-     and "Your refund is complete."
-   - The right pane shows `Refund: SUCCEEDED`.
+     and "Your refund is complete." The customer didn't ask: the work just
+     continued and the agent reported back.
+   - The right pane shows the case note saved to `LONG-TERM MEMORY` and
+     `Refund: SUCCEEDED`. Point: Temporal finished the work, so the agent got
+     to save what it learned; Demo 1's process never did.
 6. Optional:
    - the Workflow in the Web UI
    - with `--real`, the one refund in the Stripe Dashboard
@@ -192,8 +198,9 @@ Talk from the quick hits on each slide.
 "paused."
 
 - The Workflow stays Running.
-- The on-screen `(demo pauses here, before Stripe)` is the Workflow waiting for
-  the demo's `release` Signal before the refund.
+- The on-screen `(demo pauses here, before Stripe)` is the stage's Worker hook
+  holding the refund Activity before it calls Stripe. The Workflow itself has
+  no pause.
 
 **If the right pane says `Could not re-read Temporal.`:**
 
@@ -209,15 +216,15 @@ Talk from the quick hits on each slide.
 - **Why history grows:** each turn sends all of working memory to the model
   step again, and Event History records every send. A long agent run builds a
   big history.
-- **This demo:** allows at most 10 turns and stays under 7 KB of payloads.
+- **This demo:** allows at most 10 turns; an offline run records about 8 KB of
+  Activity payloads.
 - **Claim check:** keep a big result in your store and only a small key in
   Event History.
 - **Continue-As-New:** "Temporal suggests it (about 4 MiB); your code calls it."
   The Workflow keeps its Workflow ID and gets a new Run ID and a fresh Event
   History.
-- **Here:** roll over only before the refund. The refund's idempotency key
-  includes the Run ID, so a refund retried in a new run would send a new key,
-  and Stripe couldn't tell it was a retry.
+- **Here:** the refund's idempotency key comes from the Workflow ID, which
+  Continue-As-New keeps, so a refund retried in a new run sends the same key.
 
 **Avoid:** making Continue-As-New sound automatic, or saying the Workflow
 "keeps track of" its history.
@@ -251,16 +258,17 @@ Talk from the quick hits on each slide.
 - **Lead with why:** starting over repeats every model call and pays for each
   one again. Replay returns recorded results, so it doesn't pay again for
   finished calls. Only a call in flight at the crash can run twice.
-- **Say the date and model:** "Measured October 26, on GPT-5.6 Luna."
-- **Demo 1:** one pass made 4 model calls, 3,006 tokens, $0.0009. Starting
-  over made 4 more calls, 2,972 tokens, and $0.0009 more (October 2).
-- **Demo 2:** the pass before the kill made 4 model calls, 2,991 tokens,
-  $0.0009. Replay after the kill added 0 model calls, so no more tokens or
-  dollars.
-- **At scale:** 1M requests a month comes to about 3B tokens and about $900.
-  Say it's an estimate, and give its basis: the measured Demo 1 pass size,
+- **Say the date and model:** "Measured November 23, on GPT-5.6 Luna."
+- **Demo 1:** one pass made 6 model calls, 4,235 tokens, about $0.0013.
+  Starting over pays for a whole pass again.
+- **Demo 2:** 6 model calls in all, 4,426 tokens, about $0.0015. Replay after
+  the kill added no model calls.
+- **At scale:** 1M requests a month comes to about 4.4B tokens and about
+  $1,500. Say it's an estimate, and give its basis: the measured Demo 2 size,
   model calls only, at GPT-5.6 Luna list prices as of 2026-09-29.
-- **Default `make run`:** makes no model calls, because a fixed policy stands
+- **If asked:** that run predates the `search_memory` tool, which adds one
+  lookup turn per demo.
+- **`make run-offline`:** makes no model calls, because a fixed policy stands
   in for the model.
 
 **Avoid:** "as of today," "lower cost per agent loop," and leading with $0.
@@ -276,10 +284,10 @@ Talk from the quick hits on each slide.
 
 - **For reasoning:** context and memory.
 - **For the operation:** execution state, which Temporal records in Event
-  History, and effect state, which Stripe owns.
+  History, and the refund itself, which Stripe owns.
 - "Memory helps reasoning continue. Temporal helps the operation continue."
 - Stripe, not either of them, knows whether money moved.
-- "Do not ask agent memory to serve as proof of an external effect."
+- "Do not ask agent memory to serve as proof that the refund happened."
 - "Give the work a durable execution owner, and carry one identity across the
   systems that must recover it."
 
@@ -291,9 +299,9 @@ Talk from the quick hits on each slide.
 
 **Land:**
 
-- **No keys:** `make setup && make run` runs both demos offline.
+- **No keys:** `make setup && make run-offline` runs both demos offline.
 - **Name what this take ran:** the video used a live model and Stripe test
-  keys. `make run` needs neither.
+  keys. `make run-offline` needs neither.
 - **Local Temporal:** `temporal server start-dev` gives you a local Temporal
   Service and Web UI.
 - **For your coding agent:** the Temporal developer skill.
@@ -305,7 +313,7 @@ Talk from the quick hits on each slide.
 | Prompt | What appears | Target |
 | --- | --- | --- |
 | `Press Enter to start Demo 1 (without Temporal)` | Empty `AGENT PROCESS` | 0:20 |
-| `you>` + Enter through 2 answers | `(memory)` lookups<br>`→ Next: issue refund`<br>`Next step: submit the refund.` | 1:00 |
+| `you>` + Enter through 2 answers | lookups, then `Past cases (memory)`<br>`→ Next: issue refund`<br>`Next step: submit the refund.` | 1:00 |
 | `Press Enter to submit the refund` | `PROCESS GONE`, `WHAT'S LEFT` | 1:15 |
 | `Press Enter to start a new agent process` | `NEW AGENT PROCESS`: "No answers. No next step." | 1:25 |
 | `Ask the new process: What happened to my refund?` | `THE CUSTOMER STARTS OVER` | 2:00 |
@@ -337,11 +345,11 @@ Talk from the quick hits on each slide.
 
 ## Other stage paths
 
-Both are optional endings, not the main payoff. Both run offline; add `--real`
-for Stripe test mode. Details: [GUIDE.md](GUIDE.md).
+Both are optional endings, not the main payoff. Both commands below run
+offline; use `--real` in place of `--offline` for Stripe test mode. Details: [GUIDE.md](GUIDE.md).
 
 **Retry in flight:** `make failure`, which runs
-`uv run refund-demo stage --simulate-stripe-timeout`.
+`uv run refund-demo stage --offline --simulate-stripe-timeout`.
 
 1. The Worker is stopped while `issue_refund` waits on a simulated Stripe
    timeout, before any refund is accepted.
@@ -349,17 +357,18 @@ for Stripe test mode. Details: [GUIDE.md](GUIDE.md).
    the refund reach Stripe.
 
 **Crash after Stripe accepts the refund:**
-`uv run refund-demo stage --simulate-stripe-retry`.
+`uv run refund-demo stage --offline --simulate-stripe-retry`.
 
-1. Stripe accepts attempt 1.
-2. The Worker stops before Temporal records the result.
-3. The new Worker's retry sends the same idempotency key, so the two calls
+1. As in the main run, attempt 1 is held and its Worker stopped before Stripe.
+2. Stripe accepts attempt 2.
+3. That Worker stops before Temporal records the result.
+4. The new Worker's attempt 3 sends the same idempotency key, so the two calls
    resolve to one refund: `2 CALLS → 1 REFUND`.
 
 ## Rehearse
 
 1. **Words only:** walk the frames offline, without a timer.
-2. **Timed offline:** one complete `make run`. Aim 30 seconds under your slot,
+2. **Timed offline:** one complete `make run-offline`. Aim 30 seconds under your slot,
    so applause, latency, and transitions fit.
 3. **Recovery drill:** keep going after a slow model, a slow Worker restart, an
    extra Enter, or lost terminal focus.
@@ -423,8 +432,8 @@ Show only the boundary, this condensed excerpt from
 ```python
 result = await workflow.execute_activity(
     issue_refund,
-    args=[request, decision, self.working_memory],
-    heartbeat_timeout=heartbeat_timeout,
+    args=[request, decision],
+    heartbeat_timeout=REFUND_HEARTBEAT_TIMEOUT,
     retry_policy=RetryPolicy(...),
 )
 ```
@@ -433,8 +442,8 @@ result = await workflow.execute_activity(
 - Customer answers arrive as durable Signals.
 - The lookups and the refund run as Activities, so Temporal records each
   result and where the loop stands.
-- Inside the refund Activity, the idempotency key is built from the Workflow ID
-  and Run ID.
+- Inside the refund Activity, the idempotency key is built from the Workflow
+  ID: one refund request, one key.
 
 **Unless asked, don't explain:**
 

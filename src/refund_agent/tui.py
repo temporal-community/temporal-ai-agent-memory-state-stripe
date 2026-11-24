@@ -2,16 +2,16 @@
 
 This is a read-only presentation tool. It never changes Workflow behavior.
 
-The left panel reflects the Worker's in-process view, which the Worker mirrors
-to a file. The panel reads as lost the moment the Worker process is gone, so a
-restart blanks it on stage. The state panel is read from Temporal and
-the refund ledger, which survive a restart. That contrast is the point.
+The left panel shows the agent's live view, read with the Workflow's `progress`
+Query. A Query is answered by a running Worker, so the panel reads as lost the
+moment the Worker process is gone, and a restart blanks it on stage. The state
+panel is read from Temporal's Event History and the refund ledger, which
+survive a restart. That contrast is the point.
 """
 
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 from dataclasses import dataclass
 
@@ -27,10 +27,16 @@ from temporalio.client import Client
 from temporalio.converter import DataConverter
 from temporalio.service import RPCError
 
+from refund_agent import store
+from refund_agent.activities.tools import (
+    MEMORY_LABEL,
+    TOOL_MEMORY,
+    case_note_lines,
+    past_cases_summary,
+)
 from refund_agent.cli import _event_rows, _phase
 from refund_agent.fake_stripe import find_refund
 from refund_agent.settings import (
-    agent_view_path,
     temporal_address,
     temporal_identity,
     temporal_namespace,
@@ -44,6 +50,7 @@ _LOOKUP_LABELS = {
     "lookup_order": "Order",
     "lookup_customer_history": "Refund history",
     "check_refund_policy": "Refund policy",
+    TOOL_MEMORY: MEMORY_LABEL,
 }
 
 
@@ -55,42 +62,58 @@ class DemoSetup:
     model_provider: str | None = None
 
     @property
-    def effect_heading(self) -> str:
+    def ledger_heading(self) -> str:
         # Never label the offline ledger as plain "Stripe".
         if self.real_stripe:
             return "STRIPE (test mode)"
         return "OFFLINE LEDGER (Stripe stand-in)"
 
     @property
-    def _effect_note(self) -> str:
+    def _ledger_note(self) -> str:
         return "Stripe test mode" if self.real_stripe else "offline ledger (no Stripe)"
+
+    @property
+    def offline(self) -> bool:
+        # No model calls and no Stripe: chosen with --offline or at the key prompt.
+        return not self.real_stripe and not self.model_provider
 
     @property
     def naive_line(self) -> str:
         # With --real-model, Demo 1 runs the same live model step as Demo 2.
-        if self.model_provider:
+        if self.model_provider or self.offline:
             return self.durable_line
-        return f"Scripted steps · {self._effect_note}"
+        return f"Scripted steps · {self._ledger_note}"
 
     @property
     def durable_line(self) -> str:
+        if self.offline:
+            # Unmistakable on every frame: nothing here calls a model.
+            return f"{OFFLINE_BANNER} · {self._ledger_note}"
         if self.model_provider:
             policy = f"Live model ({self.model_provider})"
         else:
             policy = "Fixed policy (no LLM)"
-        return f"{policy} · sample lookups · {self._effect_note}"
+        return f"{policy} · sample lookups · {self._ledger_note}"
+
+
+OFFLINE_BANNER = "OFFLINE: fixed policy, no model calls"
 
 
 OFFLINE_SETUP = DemoSetup()
 
 
 def _demo_header(title: str, subtitle: str, setup_line: str) -> Text:
-    """Title, one-line subtitle, and the dim disclosure of what is scripted."""
+    """Title, one-line subtitle, and the disclosure of what is scripted.
+
+    An offline run's line is bold yellow instead of dim, so nobody mistakes the
+    fixed policy for a model.
+    """
 
     header = Text()
     header.append(f"{title}\n", style="bold")
     header.append(f"{subtitle}\n", style="dim")
-    header.append(setup_line, style="dim italic")
+    offline = setup_line.startswith(OFFLINE_BANNER)
+    header.append(setup_line, style="bold yellow" if offline else "dim italic")
     return header
 
 
@@ -112,44 +135,66 @@ def _worker_alive() -> tuple[bool, int | None]:
     return True, pid
 
 
-def _read_agent_view(workflow_id: str) -> dict:
-    path = agent_view_path(workflow_id)
-    if not path.exists():
+def view_from_progress(progress: dict | None) -> dict:
+    """The agent's live view from a `progress` Query result.
+
+    context is the request, observations are the lookups it made (its own
+    turns and customer answers are left out of this panel), and decision is
+    the agent's decision once it has one.
+    """
+
+    if not progress or not progress.get("request"):
         return {}
+    observations = [
+        observation
+        for observation in progress.get("working_memory") or []
+        if observation.get("tool") in _LOOKUP_LABELS
+    ]
+    return {
+        "context": progress.get("request") or {},
+        "observations": observations,
+        "decision": progress.get("decision"),
+    }
+
+
+async def _query_agent_view(client: Client, workflow_id: str) -> dict:
+    # A Query needs a running Worker; without one the view is simply absent.
+    handle = client.get_workflow_handle(workflow_id)
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
+        progress = await asyncio.wait_for(handle.query("progress"), timeout=2)
+    except Exception:
         return {}
+    return view_from_progress(progress)
 
 
-def _agent_panel(workflow_id: str) -> Panel:
+def _agent_panel(workflow_id: str, view: dict | None = None) -> Panel:
     alive, _ = _worker_alive()
     body = Text()
     if not alive:
         body.append("LOST\n\n", style="bold red")
         body.append(
-            "context and retrieved memory were this\n"
-            "Worker's live view. They can be rebuilt.\n\n"
+            "This Worker's copy of context and\n"
+            "working memory is gone. Replay rebuilds\n"
+            "both from Event History.\n\n"
             "Temporal still owns execution progress;\n"
-            "the effect owner still owns the refund outcome.",
+            "Stripe is still the source of truth for the refund.",
             style="red",
         )
         return Panel(
             body,
-            title="CONTEXT + MEMORY (Worker process)",
+            title="CONTEXT + WORKING MEMORY (Worker copy)",
             border_style="red",
         )
 
-    view = _read_agent_view(workflow_id)
     if not view:
         body.append("How can I help you?\n\n", style="bold cyan")
         body.append(
-            "waiting for a refund request\nno context assembled; no memory retrieved",
+            "waiting for a refund request\nno context assembled yet",
             style="dim",
         )
         return Panel(
             body,
-            title="CONTEXT + MEMORY (Worker process)",
+            title="CONTEXT + WORKING MEMORY (Worker copy)",
             border_style="cyan",
         )
 
@@ -164,11 +209,11 @@ def _agent_panel(workflow_id: str) -> Panel:
         f"  customer {context.get('customer_id')}\n"
         f"  amount   {context.get('amount_cents')} cents\n\n"
     )
-    body.append("MEMORY (retrieved copies for the decision)\n", style="bold blue")
+    body.append("WORKING MEMORY (this run's results)\n", style="bold blue")
     if observations:
         for obs in observations:
             body.append(f"  {obs.get('tool')}\n")
-        body.append("  source records remain domain state\n", style="dim")
+        body.append("  part of Workflow state; replay rebuilds it\n", style="dim")
     else:
         body.append("  nothing retrieved yet\n", style="dim")
     body.append("\n")
@@ -181,7 +226,7 @@ def _agent_panel(workflow_id: str) -> Panel:
         body.append("  not decided yet\n", style="dim")
     return Panel(
         body,
-        title="CONTEXT + MEMORY (Worker process)",
+        title="CONTEXT + WORKING MEMORY (Worker copy)",
         border_style="cyan",
     )
 
@@ -194,8 +239,12 @@ def _stage_agent_panel(
     loop_steps: list[dict[str, str]] | None = None,
     pending_question: dict[str, str] | None = None,
     stopped_before_refund: bool = False,
+    view: dict | None = None,
 ) -> Panel:
-    """Plain-language Worker view for a general-audience talk."""
+    """Plain-language Worker view for a general-audience talk.
+
+    `view` is the agent's live view from the progress Query (view_from_progress).
+    """
 
     alive, _ = _worker_alive()
     body = Text()
@@ -217,8 +266,11 @@ def _stage_agent_panel(
     if recovered:
         body.append("NO REPEATED QUESTIONS\nNO LOOP RESTART\n\n", style="bold green")
         body.append("Same loop, rebuilt from Temporal.\n\n", style="green")
-        body.append("AGENT\n", style="bold cyan")
         normalized_status = (refund_status or "unknown").lower()
+        body.append("AGENT", style="bold cyan")
+        # The Workflow finishes on its own, so the agent reports back without
+        # the customer asking, unlike Demo 1's new process.
+        body.append("  (the customer didn't ask)\n", style="dim")
         if normalized_status == "succeeded":
             body.append("  Your refund is complete.", style="bold")
             border_style = "green"
@@ -239,7 +291,6 @@ def _stage_agent_panel(
         _append_loop_steps(body, loop_steps or [], pending_question=pending_question)
         return Panel(body, title="TEMPORAL WORKER", border_style="cyan")
 
-    view = _read_agent_view(workflow_id)
     if not view:
         body.append("Welcome back, Nyghtowl\n\n", style="bold cyan")
         body.append("How can I help?", style="dim")
@@ -259,6 +310,7 @@ def _stage_agent_panel(
         "lookup_order": "Order details",
         "lookup_customer_history": "Customer history",
         "check_refund_policy": "Refund policy",
+        TOOL_MEMORY: MEMORY_LABEL,
     }
     if observations:
         for observation in observations:
@@ -307,9 +359,11 @@ def _append_loop_steps(
             }.get(step.get("question_id", ""), "Answer")
             body.append(f"  ✓ {label}: {step.get('result')}\n", style="green")
         elif kind == "tool":
-            # A lookup is what the agent looks up: the intro frame's MEMORY.
-            body.append(f"  ✓ {step.get('label')}: {step.get('result')}", style="green")
-            body.append(" (memory)\n", style="dim")
+            # Only search_memory reads memory, and its label says so. The other
+            # lookups read records the agent uses, not memory.
+            body.append(
+                f"  ✓ {step.get('label')}: {step.get('result')}\n", style="green"
+            )
         elif kind == "ready":
             body.append(f"  → Next: {step.get('result')}\n", style="bold yellow")
     if pending_question:
@@ -341,11 +395,7 @@ async def _system_panel(client: Client, workflow_id: str) -> Panel:
     body.append("EXECUTION STATE — owner: Temporal\n", style="bold green")
     body.append(f"  status  {status}\n")
     body.append(f"  phase   {phase}\n\n")
-    tools = [
-        name
-        for name in ("lookup_order", "lookup_customer_history", "check_refund_policy")
-        if name in completed
-    ]
+    tools = [name for name in _LOOKUP_LABELS if name in completed]
     body.append("  recorded progress\n", style="bold green")
     body.append(f"  agent tools     {len(tools)} recorded\n")
     if "approve" in signals:
@@ -368,10 +418,17 @@ async def _system_panel(client: Client, workflow_id: str) -> Panel:
 
     refund = find_refund(workflow_id)
     original_refund_id = str(refund.get("refund_id")) if refund else ""
-    effect_owner = (
+    refund_owner = (
         "demo ledger" if original_refund_id.startswith("re_dry_") else "Stripe"
     )
-    body.append(f"EFFECT STATE — owner: {effect_owner}\n", style="bold green")
+    # Stripe's record wins over any copy, so it is the source of truth.
+    # The offline ledger is never labeled as plain Stripe.
+    ledger_heading = (
+        "STRIPE (source of truth)"
+        if refund_owner == "Stripe"
+        else "OFFLINE LEDGER (Stripe stand-in, source of truth)"
+    )
+    body.append(f"{ledger_heading}\n", style="bold green")
     if refund is None:
         body.append("  none yet\n", style="dim")
     else:
@@ -393,7 +450,7 @@ async def _system_panel(client: Client, workflow_id: str) -> Panel:
             body.append("  completion recorded; replay skips it\n", style="dim")
         else:
             body.append(
-                "  effect accepted; completion unrecorded\n",
+                "  refund accepted; completion unrecorded\n",
                 style="dim",
             )
     return Panel(
@@ -412,6 +469,7 @@ def _stage_system_view(
     denied: bool = False,
     loop_steps: list[dict[str, str]] | None = None,
     loop_source: str | None = None,
+    case_note: str | None = None,
     setup: DemoSetup = OFFLINE_SETUP,
 ) -> Panel:
     """Render the durable side without SDK or systems-design vocabulary.
@@ -424,11 +482,11 @@ def _stage_system_view(
     """
 
     body = Text()
-    effect_heading = setup.effect_heading
+    ledger_heading = setup.ledger_heading
     if status is None:
         body.append("TEMPORAL\n", style="bold green")
         body.append("  No refund request yet.\n\n", style="dim")
-        body.append(f"{effect_heading}\n", style="bold green")
+        body.append(f"{ledger_heading}\n", style="bold green")
         body.append("  Payment: PAID\n")
         body.append("  Refund: none\n", style="dim")
         return Panel(body, title="WHAT SURVIVES", border_style="green")
@@ -437,7 +495,7 @@ def _stage_system_view(
         body.append("TEMPORAL\n", style="bold green")
         body.append("  This request is complete.\n")
         body.append("  No refund step was started.\n\n")
-        body.append(f"{effect_heading}\n", style="bold green")
+        body.append(f"{ledger_heading}\n", style="bold green")
         body.append("  Payment: PAID\n")
         body.append("  Refund: none\n", style="dim")
         return Panel(body, title="WHAT SURVIVES", border_style="green")
@@ -474,12 +532,20 @@ def _stage_system_view(
         if ready:
             body.append(f"  Next action: {ready.get('result')}\n", style="bold green")
             if loop_source is None:
-                # The demo-only release Signal wait (RefundWorkflow.run).
+                # The stage's Worker hook holds the refund here (demo_hooks.py).
                 body.append("  (demo pauses here, before Stripe)\n", style="dim")
-    if pending_attempt is not None:
+    if case_note is not None:
+        # remember_case ran after the refund, in the new Worker: the case note
+        # exists because Temporal carried the run through to its end.
+        body.append("\nLONG-TERM MEMORY\n", style="bold blue")
+        body.append("  Case note saved after the refund:\n")
+        for line in case_note_lines(case_note):
+            body.append(f"    {line}\n")
+    # A first attempt is not news; a later one means Temporal is retrying.
+    if pending_attempt is not None and pending_attempt > 1:
         body.append(f"  Current attempt: {pending_attempt}\n")
 
-    body.append(f"\n{effect_heading}\n", style="bold green")
+    body.append(f"\n{ledger_heading}\n", style="bold green")
     body.append("  Payment: PAID\n")
     if refund is None:
         body.append("  Refund: none\n", style="dim")
@@ -543,7 +609,18 @@ async def _loop_steps_from_history(
         elif kind == "activity_task_completed_event_attributes":
             attributes = event.activity_task_completed_event_attributes
             name = activity_names.get(attributes.scheduled_event_id, "")
-            if name in _LOOKUP_LABELS:
+            if name == TOOL_MEMORY:
+                # Read back from Event History, so the screen can say "none yet".
+                [memory] = await converter.decode(attributes.result.payloads)
+                steps.append(
+                    {
+                        "kind": "tool",
+                        "tool": name,
+                        "label": MEMORY_LABEL,
+                        "result": past_cases_summary(memory),
+                    }
+                )
+            elif name in _LOOKUP_LABELS:
                 steps.append(
                     {
                         "kind": "tool",
@@ -620,6 +697,13 @@ async def _stage_system_panel(
     )
     pending = list(description.raw_description.pending_activities)
     pending_attempt = int(pending[0].attempt) if pending else None
+    # The Workflow completes only after remember_case, so a finished run has
+    # its note in the store, keyed by the Workflow ID.
+    case_note = (
+        store.get_case_note(workflow_id)
+        if status == "COMPLETED" and refund_step_completed
+        else None
+    )
     return _stage_system_view(
         status=status,
         refund=find_refund(workflow_id),
@@ -627,6 +711,7 @@ async def _stage_system_panel(
         refund_step_completed=refund_step_completed,
         loop_steps=loop_steps,
         loop_source=loop_source,
+        case_note=case_note,
         setup=setup,
     )
 
@@ -636,7 +721,7 @@ def _header(workflow_id: str) -> Panel:
     text.append("Demo 2: Durable Refund Agent", style="bold")
     text.append(f"    workflow {workflow_id}\n", style="dim")
     text.append(
-        "CONTEXT + MEMORY help decide.  STATE records what must not be guessed.\n"
+        "Working memory is part of Workflow state.  Stripe is the source of truth.\n"
         "Crash question: did the refund commit, and where should execution resume?",
         style="dim",
     )
@@ -708,7 +793,9 @@ async def watch(workflow_id: str) -> None:
     )
     with Live(screen=True, refresh_per_second=8) as live:
         while True:
-            agent = _agent_panel(workflow_id)
+            alive, _ = _worker_alive()
+            view = await _query_agent_view(client, workflow_id) if alive else {}
+            agent = _agent_panel(workflow_id, view)
             system = await _system_panel(client, workflow_id)
             live.update(_build(workflow_id, agent, system))
             await asyncio.sleep(0.5)

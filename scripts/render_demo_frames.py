@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import io
-import json
 import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -16,7 +15,6 @@ from rich.text import Text
 
 from refund_agent import tui
 from refund_agent.naive_refund import _demo_frame
-from refund_agent.settings import agent_view_path
 
 WORKFLOW_ID = "demo-recovery"
 # The README frames are rendered offline, so they say "offline ledger", not Stripe.
@@ -26,8 +24,21 @@ DEMO_LOOP_STEPS = [
     {"kind": "answer", "question_id": "damage", "result": "Split seam"},
     {"kind": "tool", "label": "Order", "result": "python plushy"},
     {"kind": "tool", "label": "Refund history", "result": "clean"},
+    {
+        "kind": "tool",
+        "tool": "search_memory",
+        "label": "Past cases (memory)",
+        "result": "none yet",
+    },
     {"kind": "ready", "label": "Next action", "result": "issue refund"},
 ]
+
+# The note remember_case writes after the refund, with a fixed date so the
+# frames are deterministic.
+DEMO_CASE_NOTE = (
+    "2026-11-23: refund succeeded for order-1234, $80.00. "
+    "Clean history and a damaged item."
+)
 
 
 def _export(renderable: object, destination: Path, *, title: str) -> None:
@@ -72,7 +83,9 @@ def _system_panel(
         body.append("  none\n\n")
     else:
         body.append(f"  issue_refund attempt {attempt}\n\n")
-    body.append("EFFECT STATE — owner: demo ledger\n", style="bold green")
+    body.append(
+        "OFFLINE LEDGER (Stripe stand-in, source of truth)\n", style="bold green"
+    )
     if calls is None:
         body.append("  none yet\n", style="dim")
     else:
@@ -88,7 +101,7 @@ def _system_panel(
             )
         else:
             body.append(
-                "  effect accepted; completion unrecorded\n",
+                "  refund accepted; completion unrecorded\n",
                 style="yellow",
             )
     return Panel(
@@ -98,22 +111,10 @@ def _system_panel(
     )
 
 
-def _waiting_system_panel() -> Panel:
-    body = Text()
-    body.append("waiting for workflow\n\n", style="dim")
-    body.append(f"no execution named {WORKFLOW_ID} yet", style="dim")
-    return Panel(
-        body,
-        title="STATE (durable owners)",
-        border_style="green",
-    )
-
-
 def _render_naive_frames(output_dir: Path) -> None:
     active_agent = {
         "user_message": "Please refund order 1234",
         "context": {"order": "1234", "amount": 8000, "customer": "Nyghtowl"},
-        "memory": {"tenure_days": 824, "prior_refunds": 1},
         "_loop_steps": DEMO_LOOP_STEPS,
         "note": "agent chose the refund before Stripe was called",
     }
@@ -122,7 +123,8 @@ def _render_naive_frames(output_dir: Path) -> None:
         "context": {"order": "1234", "amount": 8000, "customer": "Nyghtowl"},
         "_status_checked": True,
         "_refund_missing": True,
-        "_replacement_worker": True,
+        "_past_cases": 0,
+        "_new_process": True,
         "note": "replacement process checked Stripe after the customer asked",
     }
     frames = [
@@ -139,7 +141,7 @@ def _render_naive_frames(output_dir: Path) -> None:
         (
             "03-naive-worker-gone.html",
             _demo_frame(
-                {"_worker_gone": True},
+                {"_process_gone": True},
                 [],
                 stage_mode=True,
                 setup=SETUP,
@@ -149,7 +151,7 @@ def _render_naive_frames(output_dir: Path) -> None:
         (
             "04-naive-replacement.html",
             _demo_frame(
-                {"_restarted": True, "_replacement_worker": True},
+                {"_restarted": True, "_new_process": True},
                 [],
                 stage_mode=True,
                 setup=SETUP,
@@ -190,24 +192,6 @@ def _render_durable_frames(output_dir: Path) -> None:
                 title="Demo 2 — ready",
             )
 
-            view = {
-                "context": {
-                    "request_id": WORKFLOW_ID,
-                    "order_id": "order-1234",
-                    "customer_id": "cus_demo_42",
-                    "amount_cents": 8000,
-                    "reason": "Please refund order 1234",
-                },
-                "observations": [
-                    {"tool": "lookup_order"},
-                    {"tool": "lookup_customer_history"},
-                ],
-                "decision": {"recommendation": "approve", "source": "canned"},
-            }
-            path = agent_view_path(WORKFLOW_ID)
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(json.dumps(view), encoding="utf-8")
-
             tui._worker_alive = lambda: (False, 4242)
             lost_agent = tui._stage_agent_panel(WORKFLOW_ID, stopped_before_refund=True)
             _export(
@@ -245,6 +229,7 @@ def _render_durable_frames(output_dir: Path) -> None:
                         pending_attempt=None,
                         refund_step_completed=True,
                         loop_steps=DEMO_LOOP_STEPS,
+                        case_note=DEMO_CASE_NOTE,
                         setup=SETUP,
                     ),
                     setup=SETUP,
