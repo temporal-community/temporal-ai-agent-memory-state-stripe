@@ -1204,3 +1204,87 @@ def test_start_offline_records_the_fixed_policy(_no_live_keys, monkeypatch) -> N
     [request] = started
     assert request.dry_run is True
     assert request.model_provider == OFFLINE_POLICY
+
+
+def test_start_derives_the_workflow_id_from_the_request_id(
+    _no_live_keys, monkeypatch
+) -> None:
+    from temporalio.common import WorkflowIDConflictPolicy, WorkflowIDReusePolicy
+
+    from refund_agent import cli
+
+    calls: list = []
+
+    class FakeClient:
+        async def start_workflow(self, _run, request, **kwargs):
+            calls.append((request, kwargs))
+
+    async def fake_client():
+        return FakeClient()
+
+    monkeypatch.setattr(cli, "_client", fake_client)
+
+    args = ["start", "--offline", "--request-id", "refund-123"]
+    asyncio.run(cli._start(_parser().parse_args(args)))
+
+    [(request, kwargs)] = calls
+    assert request.request_id == "refund-123"
+    assert kwargs["id"] == "refund-refund-123"
+    assert kwargs["id_conflict_policy"] == WorkflowIDConflictPolicy.FAIL
+    assert (
+        kwargs["id_reuse_policy"] == WorkflowIDReusePolicy.ALLOW_DUPLICATE_FAILED_ONLY
+    )
+
+
+def test_start_reports_a_request_that_already_has_a_workflow(
+    _no_live_keys, monkeypatch, capsys
+) -> None:
+    from temporalio.exceptions import WorkflowAlreadyStartedError
+
+    from refund_agent import cli
+
+    class FakeClient:
+        async def start_workflow(self, _run, _request, **kwargs):
+            raise WorkflowAlreadyStartedError(kwargs["id"], "RefundApprovalAgent")
+
+    async def fake_client():
+        return FakeClient()
+
+    monkeypatch.setattr(cli, "_client", fake_client)
+
+    args = ["start", "--offline", "--request-id", "refund-123"]
+    asyncio.run(cli._start(_parser().parse_args(args)))
+
+    out = capsys.readouterr().out
+    assert "request refund-123 already has a Workflow (refund-refund-123)" in out
+
+
+@pytest.mark.parametrize("terminate", [False, True])
+def test_stop_cancels_unless_told_to_terminate(terminate, monkeypatch, capsys) -> None:
+    from refund_agent import cli
+
+    calls: list[str] = []
+
+    class FakeHandle:
+        async def cancel(self):
+            calls.append("cancel")
+
+        async def terminate(self, reason=None):
+            calls.append("terminate")
+
+    class FakeClient:
+        def get_workflow_handle(self, _workflow_id):
+            return FakeHandle()
+
+    async def fake_client():
+        return FakeClient()
+
+    monkeypatch.setattr(cli, "_client", fake_client)
+
+    args = ["stop", "wf-1"] + (["--terminate"] if terminate else [])
+    asyncio.run(cli._stop(_parser().parse_args(args)))
+
+    assert calls == (["terminate"] if terminate else ["cancel"])
+    out = capsys.readouterr().out
+    assert ("terminated" in out) is terminate
+    assert ("cancel requested" in out) is not terminate

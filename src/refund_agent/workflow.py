@@ -8,6 +8,7 @@ Temporal records every completed step in Event History and a new Worker
 resumes the loop exactly where the old one stopped.
 """
 
+import asyncio
 from dataclasses import asdict
 from datetime import timedelta
 
@@ -84,47 +85,56 @@ class RefundWorkflow:
         self._phase = "deciding"
         workflow.logger.info("EXECUTION STATE | phase=agent_loop_start")
 
-        # OBSERVE, REASON, ACT: the shared loop runs until the agent decides.
-        decision = await run_agent_loop(
-            request,
-            self.working_memory,
-            decide=self._decide,
-            use_tool=self._use_tool,
-            ask_customer=self._ask_customer,
-        )
-        self._decision = decision
-        workflow.logger.info(
-            f"EXECUTION STATE | phase=decided recommendation={decision.recommendation}"
-        )
-
-        if decision.recommendation == "deny":
-            self._phase = "denied"
-            return RefundResult(
-                refund_id="none",
-                status="denied",
-                amount_cents=request.amount_cents,
-                idempotency_key="none",
-                activity_attempt=0,
-                mode="denied",
+        # CANCELLATION before the refund: nothing has reached Stripe yet, so
+        # there is nothing to undo. Record it and let the Workflow close as
+        # Cancelled; Temporal cancels any model call or wait in flight.
+        try:
+            # OBSERVE, REASON, ACT: the shared loop runs until the agent decides.
+            decision = await run_agent_loop(
+                request,
+                self.working_memory,
+                decide=self._decide,
+                use_tool=self._use_tool,
+                ask_customer=self._ask_customer,
+            )
+            self._decision = decision
+            workflow.logger.info(
+                "EXECUTION STATE | phase=decided "
+                f"recommendation={decision.recommendation}"
             )
 
-        if not decision.recommendation == "approve":
-            # Escalate. Treat anything that is not an explicit approve as needing
-            # a human, so the irreversible refund never runs without a gate.
-            workflow.logger.info(
-                "EXECUTION STATE | phase=waiting_for_approval | DURABLE WAIT"
-            )
-            self._phase = "waiting_for_approval"
-            # DURABLE WAIT: no Worker process has to remain alive here.
-            await workflow.wait_condition(lambda: self.approved)
-            workflow.logger.info(
-                f"EXECUTION STATE | phase=approved note={self.approval_note}"
-            )
+            if decision.recommendation == "deny":
+                self._phase = "denied"
+                return RefundResult(
+                    refund_id="none",
+                    status="denied",
+                    amount_cents=request.amount_cents,
+                    idempotency_key="none",
+                    activity_attempt=0,
+                    mode="denied",
+                )
+
+            if not decision.recommendation == "approve":
+                # Escalate. Treat anything that is not an explicit approve as needing
+                # a human, so the irreversible refund never runs without a gate.
+                workflow.logger.info(
+                    "EXECUTION STATE | phase=waiting_for_approval | DURABLE WAIT"
+                )
+                self._phase = "waiting_for_approval"
+                # DURABLE WAIT: no Worker process has to remain alive here.
+                await workflow.wait_condition(lambda: self.approved)
+                workflow.logger.info(
+                    f"EXECUTION STATE | phase=approved note={self.approval_note}"
+                )
+        except asyncio.CancelledError:
+            self._phase = "cancelled"
+            workflow.logger.info("EXECUTION STATE | phase=cancelled before the refund")
+            raise
 
         # SIDE EFFECT: retries reuse one Stripe idempotency key.
         self._phase = "issuing_refund"
         workflow.logger.info("EXECUTION STATE | phase=issuing_refund")
-        result = await workflow.execute_activity(
+        refund_step = workflow.start_activity(
             issue_refund,
             args=[request, decision],
             start_to_close_timeout=REFUND_START_TO_CLOSE_TIMEOUT,
@@ -137,6 +147,18 @@ class RefundWorkflow:
             ),
             summary="Issue the refund in Stripe",
         )
+        try:
+            # CANCELLATION during the refund: the call may already have reached
+            # Stripe, so a cancel request must not abandon it halfway.
+            # asyncio.shield keeps the Activity running, and the Workflow waits
+            # for Stripe's answer, then records it and saves the case note.
+            result = await asyncio.shield(refund_step)
+        except asyncio.CancelledError:
+            workflow.logger.info(
+                "EXECUTION STATE | cancel requested during the refund; "
+                "finishing the refund first"
+            )
+            result = await refund_step
 
         # LONG-TERM MEMORY: save a short case note in the memory store, so later
         # runs for this customer can find it with search_memory. The Workflow

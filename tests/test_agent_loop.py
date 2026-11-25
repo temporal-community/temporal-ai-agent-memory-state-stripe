@@ -1065,6 +1065,12 @@ def _fake_activities(refund_may_return: asyncio.Event):
             for tool in (TOOL_ORDER, TOOL_HISTORY, TOOL_POLICY, TOOL_MEMORY):
                 if tool not in done:
                     return AgentStep(action="use_tool", tool=tool)
+        if request.customer_id == "waits-for-answer":
+            # Ask once, so the run waits on the customer_answer Signal.
+            if not any(entry.get("kind") == "answer" for entry in working_memory):
+                return AgentStep(
+                    action="ask_customer", question_id="item_opened", question="Q?"
+                )
         return AgentStep(action="decide", recommendation="approve", rationale="")
 
     @activity.defn(name="lookup_order")
@@ -1365,3 +1371,68 @@ def test_lookup_tools_take_no_ids_from_the_model() -> None:
     for schema in _TOOL_SCHEMAS:
         if schema["name"] in lookups:
             assert schema["parameters"]["properties"] == {}
+
+
+async def _check_cancel(temporal: str) -> None:
+    from temporalio.client import WorkflowFailureError
+    from temporalio.exceptions import CancelledError
+    from temporalio.testing import WorkflowEnvironment
+    from temporalio.worker import Worker
+
+    refund_may_return = asyncio.Event()
+    async with await WorkflowEnvironment.start_local(
+        dev_server_existing_path=temporal
+    ) as env:
+        queue = f"cancel-test-{uuid.uuid4().hex[:8]}"
+        async with Worker(
+            env.client,
+            task_queue=queue,
+            workflows=[RefundWorkflow],
+            activities=_fake_activities(refund_may_return),
+        ):
+            # Cancel before the refund: the run is waiting on the customer.
+            waiting = await env.client.start_workflow(
+                RefundWorkflow.run,
+                replace(_request(8000), customer_id="waits-for-answer"),
+                id=f"cancel-early-{queue}",
+                task_queue=queue,
+            )
+            deadline = time.monotonic() + 15
+            while (await waiting.query(RefundWorkflow.progress))["phase"] != (
+                "waiting_for_answer"
+            ):
+                assert time.monotonic() < deadline, "never waited on the customer"
+                await asyncio.sleep(0.05)
+            await waiting.cancel()
+            with pytest.raises(WorkflowFailureError) as failure:
+                await asyncio.wait_for(waiting.result(), timeout=15)
+            assert isinstance(failure.value.cause, CancelledError)
+            progress = await waiting.query(RefundWorkflow.progress)
+            assert progress["phase"] == "cancelled"
+
+            # Cancel during the refund: the call finishes and is recorded.
+            refunding = await env.client.start_workflow(
+                RefundWorkflow.run,
+                _request(8000),
+                id=f"cancel-late-{queue}",
+                task_queue=queue,
+            )
+            deadline = time.monotonic() + 15
+            while (await refunding.query(RefundWorkflow.progress))["phase"] != (
+                "issuing_refund"
+            ):
+                assert time.monotonic() < deadline, "never reached the refund"
+                await asyncio.sleep(0.05)
+            await refunding.cancel()
+            await asyncio.sleep(0.5)
+            refund_may_return.set()
+            result = await asyncio.wait_for(refunding.result(), timeout=15)
+            assert result.refund_id == "re_test"
+            assert result.status == "succeeded"
+
+
+def test_cancel_closes_before_the_refund_and_finishes_one_in_flight() -> None:
+    temporal = shutil.which("temporal")
+    if temporal is None:
+        pytest.skip("needs the temporal CLI on PATH")
+    asyncio.run(_check_cancel(temporal))

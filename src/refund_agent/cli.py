@@ -16,6 +16,8 @@ from typing import Any
 
 import stripe
 from temporalio.client import Client, WorkflowFailureError
+from temporalio.common import WorkflowIDConflictPolicy, WorkflowIDReusePolicy
+from temporalio.exceptions import WorkflowAlreadyStartedError
 from temporalio.service import RPCError, RPCStatusCode
 
 from refund_agent.fake_stripe import find_refund
@@ -81,7 +83,13 @@ async def _start(args: argparse.Namespace) -> None:
             )
             return
     client = await _client()
-    workflow_id = args.workflow_id or f"refund-{uuid.uuid4()}"
+    # BUSINESS IDENTITY: the Workflow ID comes from the refund request, so one
+    # request maps to one Workflow ID. Temporal then refuses a second run for a
+    # request that is still running or already succeeded (the policies on
+    # start_workflow below), and the refund's idempotency key, derived from the
+    # Workflow ID, is the same for every run of that request.
+    request_id = args.request_id or args.workflow_id or f"req-{uuid.uuid4().hex[:12]}"
+    workflow_id = args.workflow_id or f"refund-{request_id}"
     payment_intent = args.payment_intent
     if args.seed:
         # Seeding a real charge to refund against, so there is no PaymentIntent
@@ -101,7 +109,7 @@ async def _start(args: argparse.Namespace) -> None:
         )
         print("SETUP | this charge nets to zero once the refund posts")
     request = RefundRequest(
-        request_id=args.request_id or workflow_id,
+        request_id=request_id,
         order_id=args.order_id,
         customer_id=args.customer_id,
         payment_intent_id=payment_intent,
@@ -110,12 +118,32 @@ async def _start(args: argparse.Namespace) -> None:
         dry_run=offline,
         model_provider=OFFLINE_POLICY if offline else args.model_provider,
     )
-    await client.start_workflow(
-        RefundWorkflow.run,
-        request,
-        id=workflow_id,
-        task_queue=task_queue(),
-    )
+    try:
+        await client.start_workflow(
+            RefundWorkflow.run,
+            request,
+            id=workflow_id,
+            task_queue=task_queue(),
+            # A run for this request is already open: fail instead of starting
+            # a second one beside it.
+            id_conflict_policy=WorkflowIDConflictPolicy.FAIL,
+            # A closed run blocks a new one unless it failed, was cancelled,
+            # or was terminated, so a request that already got its refund
+            # can't be refunded again under the same ID.
+            id_reuse_policy=WorkflowIDReusePolicy.ALLOW_DUPLICATE_FAILED_ONLY,
+        )
+    except WorkflowAlreadyStartedError:
+        print(
+            f"THE SYSTEM | request {request_id} already has a Workflow "
+            f"({workflow_id}) that is running or completed. Check it with: "
+            f"refund-demo inspect {workflow_id}"
+        )
+        if args.seed:
+            print(
+                "THE SYSTEM | the charge seeded above was not used; "
+                "run refund-demo cleanup"
+            )
+        return
     print(f"EXECUTION STATE | started Workflow {workflow_id}")
     print(
         f"CONTEXT | refund {request.request_id}: order {request.order_id}, "
@@ -145,15 +173,35 @@ async def _stop(args: argparse.Namespace) -> None:
     client = await _client()
     handle = client.get_workflow_handle(args.workflow_id)
     try:
-        await handle.terminate(reason=args.reason)
+        if args.terminate:
+            # Terminate closes the run at once and runs no Workflow code. Use it
+            # only when no Worker will pick the run up to handle a cancel.
+            await handle.terminate(reason=args.reason)
+        else:
+            # Cancel asks the Workflow to stop and lets its code decide how:
+            # before the refund it closes as Cancelled; during the refund it
+            # finishes the Stripe call first and records the outcome.
+            await handle.cancel()
     except RPCError as error:
         if _not_found(error):
             print(f"THE SYSTEM | no running Workflow named {args.workflow_id}")
         else:
-            print(f"THE SYSTEM | could not terminate {args.workflow_id}: {error}")
+            print(f"THE SYSTEM | could not stop {args.workflow_id}: {error}")
         return
-    print(f"EXECUTION STATE | terminated Workflow {args.workflow_id}")
-    print("THE SYSTEM | if it seeded a charge, run refund-demo cleanup to reconcile")
+    if args.terminate:
+        print(f"EXECUTION STATE | terminated Workflow {args.workflow_id}")
+    else:
+        print(
+            f"EXECUTION STATE | cancel requested for {args.workflow_id}; a running "
+            "Worker handles it. Check it with: "
+            f"refund-demo inspect {args.workflow_id}"
+        )
+    # Seeded test charges are demo setup, not part of the refund request, so
+    # the Workflow never refunds them on cancel. Cleanup resets the account.
+    print(
+        "THE SYSTEM | leftover seeded test charges stay paid; "
+        "refund-demo cleanup refunds them"
+    )
 
 
 async def _result(args: argparse.Namespace) -> None:
@@ -770,8 +818,16 @@ def _parser() -> argparse.ArgumentParser:
     approve.add_argument("workflow_id")
     approve.add_argument("note", nargs="?", default="")
 
-    stop = commands.add_parser("stop", help="terminate a running Workflow")
+    stop = commands.add_parser(
+        "stop", help="cancel a running Workflow (or --terminate one no Worker runs)"
+    )
     stop.add_argument("workflow_id")
+    stop.add_argument(
+        "--terminate",
+        action="store_true",
+        help="close the run at once without running Workflow code; for runs "
+        "no Worker will pick up",
+    )
     stop.add_argument("--reason", default="stopped from refund-demo")
 
     result = commands.add_parser("result", help="wait for and print the result")

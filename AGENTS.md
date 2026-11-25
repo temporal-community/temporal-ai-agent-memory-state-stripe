@@ -184,8 +184,8 @@ the order row still wins.
 ## Changing the Workflow safely
 
 - This is a demo. Before upgrading the code, finish or terminate any running
-  demo Workflows (`uv run refund-demo stop <workflow-id>`, or Terminate in the
-  Temporal Web UI). The repository doesn't carry compatibility code for runs
+  demo Workflows (`uv run refund-demo stop <workflow-id>`, which cancels; add `--terminate`
+  when no Worker is running, or use Terminate in the Temporal Web UI). The repository doesn't carry compatibility code for runs
   started by older code: no deprecated request fields, Signals, or Activity
   signatures kept for old histories, and no `workflow.patched()` guards. Don't
   add them; change the code and re-record the replay history instead.

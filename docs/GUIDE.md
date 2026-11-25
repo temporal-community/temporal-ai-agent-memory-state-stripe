@@ -316,7 +316,7 @@ earlier run is still Running fails with `WorkflowAlreadyStartedError`.
 | After | Run |
 | --- | --- |
 | A `--real` run that ended before Demo 2's refund | `uv run refund-demo cleanup` ([what it does](#stripe-test-mode-and-cleanup)) |
-| An aborted run that left a Running Workflow | `uv run refund-demo stop <workflow-id>` |
+| An aborted run that left a Running Workflow | `uv run refund-demo stop <workflow-id>` cancels it. With no Worker running, add `--terminate` |
 | The stage process was killed hard | 1. `pgrep -fl refund_agent` lists stray stage processes.<br>2. Check each command line: `python -m refund_agent.worker` or `python -m refund_agent.naive_refund`.<br>3. Stop only those. |
 | You want an empty Workflow list in the Web UI | Press Ctrl+C on your own in-memory `temporal server start-dev`, then start it again.<br>Never do this to a server someone else is using. |
 | You want to clear local files | Stop any dev server that uses `.demo-state/temporal.db`, then run `rm -rf .demo-state`.<br>This removes stage logs, token logs (`model-usage.jsonl`), offline ledgers, and the stage-started server's database. |
@@ -912,11 +912,24 @@ uv run refund-demo result demo-refund
 Low-value requests tend to approve automatically. To push the deterministic
 policy toward escalation, use a larger amount, such as `--amount-cents 15000`.
 
-To terminate a Workflow you no longer want:
+To stop a Workflow you no longer want, cancel it:
 
 ```bash
 uv run refund-demo stop demo-refund
 ```
+
+Cancel lets the Workflow's code decide how to stop. Before the refund, the run
+closes as Cancelled, with nothing sent to Stripe. During the refund, the
+Workflow finishes the Stripe call first and records the outcome, so a cancel
+never leaves a refund half done. A Worker must be running to handle the
+cancel; for a run no Worker will pick up, add `--terminate`, which closes it
+at once without running Workflow code.
+
+`refund-demo start` builds the Workflow ID from `--request-id` (for example,
+`--request-id refund-123` gives `refund-refund-123`). Temporal refuses a second
+run for a request that is still running or already succeeded, so starting the
+same request twice prints `already has a Workflow` instead of starting another.
+A request whose run failed or was cancelled can be started again.
 
 **Stripe test mode.** Put a test key in `.env`:
 
@@ -1091,10 +1104,11 @@ For a talk, make the terminal fullscreen. Press Ctrl+C to exit.
 
 - `result` reads and waits; it does not drive the Workflow. If `result` hangs,
   see [Troubleshooting](#troubleshooting).
-- Use a fresh Workflow ID for each refund request, and terminate a stale run
+- Use a fresh Workflow ID for each refund request, and stop a stale run
   with `refund-demo stop <id>`. The idempotency key comes from the Workflow
   ID, so a rerun under the same ID gets the earlier refund back instead of a
-  new one.
+  new one. It never uses the Run ID, which changes with each run, so every run
+  in a Continue-As-New chain sends the same key too.
 - Finish or terminate running demo Workflows before you upgrade the code. The
   repository carries no compatibility code for runs started by older code.
 - To see a manual run's Event History, use [the CLI commands](#from-the-cli)
@@ -1114,7 +1128,7 @@ The first five rows are the most likely.
 | `STAGE \| Worker exited while starting:` plus a log tail | The Worker crashed at startup.<br>A common cause is a live or malformed `STRIPE_API_KEY` in `.env`, which the Worker rejects even in offline mode | Read the tail.<br>Use a `sk_test_` or `rk_test_` key, or remove the key |
 | `The stage view needs rich. Install it with: uv sync --extra tui` | Running `uv sync` without `--extra tui` removed the optional Rich extra | Run `uv sync --extra dev --extra tui` |
 | `STAGE \| the live run needs ..., and there is no terminal to ask.` (exit code 1) | The default live run is missing a key, and nothing can answer the key prompt, as when you pipe input in or run in CI | Set the keys in `.env`, or pass `--offline` |
-| `WorkflowAlreadyStartedError` traceback | You reused a `--workflow-id` while that run is still Running | Use a new ID, or run `uv run refund-demo stop <id>` |
+| `WorkflowAlreadyStartedError` traceback | You reused a `--workflow-id` while that run is still Running | Use a new ID, or run `uv run refund-demo stop <id>` (add `--terminate` if no Worker is running) |
 | `STAGE \| could not connect to configured Temporal service <address>` | `TEMPORAL_ADDRESS` names a non-local host that isn't answering.<br>The stage won't silently fall back to localhost | Fix or unset `TEMPORAL_ADDRESS` |
 | `STAGE \| Temporal dev server did not become ready` | The started server didn't answer within 20 s.<br>This also happens when `TEMPORAL_ADDRESS` uses a localhost port other than 7233, because the stage starts its server without `--port` | Start the server yourself on the port you configured, or unset `TEMPORAL_ADDRESS` |
 | `STAGE \| both live-model keys are configured; choose --model-provider` | Both model keys are set and `AGENT_MODEL_PROVIDER` is blank | Add `--model-provider anthropic` or `--model-provider openai` |

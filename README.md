@@ -23,9 +23,8 @@ can leave a customer repeating themselves, or leave a job half done. Managing
 that well starts with knowing what an agent keeps, where each piece lives, and
 what survives a crash.
 
-**The main takeaway:** on Temporal, an agent's working memory is largely the
-same as its Workflow state. Temporal records it in Event History and rebuilds
-it by replay, so it survives a crash with no code to save it.
+**The main takeaway:** building an agent on Temporal gives you working memory
+that survives a crash. You don't have to write code to save or restore it.
 
 This repo steps you through that with a working demo and the resources behind
 it. These are the kinds of information the demo explains:
@@ -993,7 +992,7 @@ check the PaymentIntent's refunds before refunding again.
 - **Not a guarantee that each step runs once.** A step that was running when
   the Worker died runs again, so the refund relies on its idempotency key
   ([Gotchas](#gotchas)).
-- **Not a memory store.** [Context, memory, and state](#context-memory-and-state)
+- **Not a long-term memory store.** [Context, memory, and state](#context-memory-and-state)
   explains why.
 - **Not a fix for model quality.** Temporal doesn't decide what the agent does
   or make the model right; evals and guardrails do.

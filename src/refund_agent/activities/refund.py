@@ -181,9 +181,11 @@ def issue_refund(request: RefundRequest, decision: RefundDecision) -> RefundResu
         )
 
     # IDEMPOTENCY KEY: derived from the Workflow ID, the refund's business
-    # identity (one refund request = one Workflow ID). Every attempt, a reset,
-    # and a new run started under the same Workflow ID all send the same key,
-    # so Stripe returns the first refund instead of creating a second one.
+    # identity (refund-demo start builds it from the request ID). Every attempt,
+    # every run in a Continue-As-New chain, and a retry of a failed run share
+    # the Workflow ID, so they all send the same key and Stripe returns the
+    # first refund instead of creating a second one. Never derive it from the
+    # Run ID, which changes with each run.
     # Stripe keeps keys for about 24 hours, so a reset after that needs an
     # Stripe check (list the PaymentIntent's refunds) before refunding again.
     idempotency_key = idempotency_key_for(workflow_id)
