@@ -167,9 +167,7 @@ one live service, pass a flag yourself:
   `--model-provider anthropic`.
   - For OpenAI, set `OPENAI_API_KEY` and `OPENAI_MODEL`. The measured runs used
     `gpt-5.6-luna`.
-  - For Anthropic, set `ANTHROPIC_API_KEY`, and set `ANTHROPIC_MODEL` to
-    `claude-sonnet-4-6`. Some newer Claude models
-    [reject this code's tool choice](docs/GUIDE.md#troubleshooting). The Claude
+  - For Anthropic, set `ANTHROPIC_API_KEY` and `ANTHROPIC_MODEL`. The Claude
     figures in [Cost to run](#cost-to-run) are estimates, not measurements.
   - If both model keys are set and you don't choose a provider, the default
     run uses OpenAI, and `--real-model` stops with an error that asks you to
@@ -422,7 +420,10 @@ What Temporal doesn't do is carry knowledge from one run to the next:
   recorded and retried like any other step.
 - Memory products such as mem0 and Amazon Bedrock AgentCore Memory decide what
   to keep, when to write it, and what to bring back into context. They plug in
-  the same way, through Activities.
+  the same way, through Activities. For a full long-term memory demo on
+  Temporal with AgentCore Memory, see the
+  [AgentCore episode](https://youtu.be/JxvKyH3pNK0) and
+  [its repo](https://github.com/temporal-community/temporal-ai-long-term-memory-agentcore).
 - Event History has size limits, described under [Gotchas](#gotchas).
 
 <details>
@@ -794,8 +795,10 @@ million Actions. The count comes from the code, not a measurement: 1 start,
 
 - GPT-5.6 Luna uses the Responses API with a required tool call, the default
   reasoning effort, and no output cap.
-- Claude Sonnet 4.6 uses `max_tokens=512` and forced tool choice, with no
-  extended thinking and no prompt caching.
+- Claude uses `tool_choice` `auto` with strict tool schemas and an instruction
+  to call exactly one tool, because current Claude models reject a forced tool
+  choice. It sends low effort and `max_tokens=4096`, so thinking fits before
+  the tool call, and no prompt caching. A reply with no tool call is retried.
 - Both clients have SDK retries off and a 45 s client timeout.
 - Demo 2 retries each model turn through Temporal, up to 5 attempts of 60 s
   each. Demo 1 has no retry layer.

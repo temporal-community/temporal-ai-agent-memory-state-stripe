@@ -220,6 +220,11 @@ _AGENT_INSTRUCTIONS = (
     "the request clearly conflicts with the order or policy says it is ineligible."
 )
 
+# Added to the Anthropic system prompt, since that call can't force a tool.
+_ANTHROPIC_ONE_TOOL = (
+    " Respond to every turn by calling exactly one tool, with no text reply."
+)
+
 _MODEL_PROVIDERS = {"anthropic", "openai"}
 
 
@@ -463,11 +468,14 @@ def _anthropic_step(
         )
     # Read before the paid call, so an invalid LOG_MODEL_USAGE fails first.
     usage_path = model_usage_path()
+    # strict keeps every tool call's arguments valid against its schema, which
+    # strict mode requires to forbid extra properties.
     tools: list[ToolParam] = [
         {
             "name": tool["name"],
             "description": tool["description"],
-            "input_schema": tool["parameters"],
+            "input_schema": {**tool["parameters"], "additionalProperties": False},
+            "strict": True,
         }
         for tool in _TOOL_SCHEMAS
     ]
@@ -477,11 +485,19 @@ def _anthropic_step(
     try:
         response = client.messages.create(
             model=model,
-            max_tokens=512,
-            system=_AGENT_INSTRUCTIONS,
+            # Room for the model's thinking before its one tool call. Current
+            # Claude models think by default, and thinking counts toward this.
+            max_tokens=4096,
+            # Low effort: each turn is one small choice, so deeper thinking
+            # only adds tokens.
+            output_config={"effort": "low"},
+            system=_AGENT_INSTRUCTIONS + _ANTHROPIC_ONE_TOOL,
             messages=[{"role": "user", "content": payload}],
             tools=tools,
-            tool_choice={"type": "any", "disable_parallel_tool_use": True},
+            # Current Claude models reject a forced tool choice ("any" or
+            # "tool") with HTTP 400, so the choice is "auto" and the
+            # instruction above asks for exactly one tool call.
+            tool_choice={"type": "auto", "disable_parallel_tool_use": True},
         )
     except anthropic.APIStatusError as error:
         status = error.status_code
@@ -502,10 +518,18 @@ def _anthropic_step(
         None,
     )
     if call is None:
+        if getattr(response, "stop_reason", None) == "refusal":
+            raise ApplicationError(
+                "Anthropic declined this turn (stop_reason refusal)",
+                type="AnthropicRefusal",
+                non_retryable=True,
+            )
+        # With tool_choice "auto" the model can answer in text instead of a
+        # tool call. That is usually a one-off, so Temporal retries the turn
+        # (up to the model retry policy's attempts in workflow.py).
         raise ApplicationError(
             "Anthropic returned no tool call for this turn",
-            type="AnthropicOutputError",
-            non_retryable=True,
+            type="AnthropicNoToolCall",
         )
     args = dict(call.input)
     source = f"anthropic:{model}"

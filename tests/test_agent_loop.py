@@ -1436,3 +1436,54 @@ def test_cancel_closes_before_the_refund_and_finishes_one_in_flight() -> None:
     if temporal is None:
         pytest.skip("needs the temporal CLI on PATH")
     asyncio.run(_check_cancel(temporal))
+
+
+def test_anthropic_call_works_on_models_that_reject_forced_tools(monkeypatch) -> None:
+    from refund_agent.activities import model
+
+    monkeypatch.delenv("LOG_MODEL_USAGE", raising=False)
+    monkeypatch.setenv("ANTHROPIC_MODEL", "test-claude")
+    sent: list[dict] = []
+    monkeypatch.setattr(
+        model,
+        "Anthropic",
+        lambda **_kw: SimpleNamespace(messages=_RecordingMessages(sent)),
+    )
+
+    model._anthropic_step(_request(8000), [], "key")
+
+    [kwargs] = sent
+    # Current Claude models return HTTP 400 for tool_choice "any" or "tool".
+    assert kwargs["tool_choice"] == {"type": "auto", "disable_parallel_tool_use": True}
+    assert "exactly one tool" in kwargs["system"]
+    assert kwargs["max_tokens"] >= 2048
+    assert all(tool["strict"] for tool in kwargs["tools"])
+    assert all(
+        tool["input_schema"]["additionalProperties"] is False
+        for tool in kwargs["tools"]
+    )
+
+
+def test_anthropic_text_reply_retries_but_a_refusal_does_not(monkeypatch) -> None:
+    from refund_agent.activities import model
+
+    monkeypatch.delenv("LOG_MODEL_USAGE", raising=False)
+    monkeypatch.setenv("ANTHROPIC_MODEL", "test-claude")
+
+    def respond(stop_reason: str):
+        response = SimpleNamespace(content=[], usage=None, stop_reason=stop_reason)
+        return lambda **_kw: SimpleNamespace(
+            messages=SimpleNamespace(create=lambda **_k: response)
+        )
+
+    monkeypatch.setattr(model, "Anthropic", respond("end_turn"))
+    with pytest.raises(ApplicationError) as text_reply:
+        model._anthropic_step(_request(8000), [], "key")
+    assert text_reply.value.type == "AnthropicNoToolCall"
+    assert not text_reply.value.non_retryable
+
+    monkeypatch.setattr(model, "Anthropic", respond("refusal"))
+    with pytest.raises(ApplicationError) as refusal:
+        model._anthropic_step(_request(8000), [], "key")
+    assert refusal.value.type == "AnthropicRefusal"
+    assert refusal.value.non_retryable
