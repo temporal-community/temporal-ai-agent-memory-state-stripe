@@ -18,7 +18,7 @@ run-offline: ## Offline stage run: no keys, no model calls
 run-real: ## Stripe test mode with the fixed policy instead of a model
 	uv run refund-demo stage --real
 
-failure: ## Kill the Worker while the refund Activity is in flight (offline)
+failure: ## (offline) Kill the Worker while the refund Activity is in flight
 	uv run refund-demo stage --offline --simulate-stripe-timeout
 
 reset: ## Refund leftover Stripe test charges; print the manual steps
@@ -26,7 +26,7 @@ reset: ## Refund leftover Stripe test charges; print the manual steps
 	uv run refund-demo cleanup
 	@echo ""
 	@echo "Nothing was deleted or stopped. To reset further, by hand:"
-	@echo "  Running Workflow from an aborted take: uv run refund-demo stop <workflow-id>"
+	@echo "  Running Workflow from an aborted take: uv run refund-demo stop <workflow-id> (add --terminate if no Worker is running)"
 	@echo "  Empty Temporal Web list: Ctrl+C your own temporal server start-dev, then"
 	@echo "    start it again. Never restart a server someone else is using."
 	@echo "  Local files: stop any dev server using .demo-state/temporal.db, then"

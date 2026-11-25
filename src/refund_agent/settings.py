@@ -1,6 +1,5 @@
 """Process settings used outside deterministic Workflow code."""
 
-import hashlib
 import math
 import os
 from pathlib import Path
@@ -62,11 +61,14 @@ def worker_pid_file() -> Path:
     return state_dir() / "worker.pid"
 
 
-def agent_view_path(workflow_id: str) -> Path:
-    """Return a filesystem-safe path for one Workflow's presentation mirror."""
+def refund_hold_marker() -> Path:
+    """Where the stage's Worker hook notes that it is holding the refund.
 
-    digest = hashlib.sha256(workflow_id.encode("utf-8")).hexdigest()[:24]
-    return state_dir() / f"agent-view-{digest}.json"
+    Demo-only (demo_hooks.py). The stage reads it from its private state
+    directory to know the refund is held before it kills the Worker.
+    """
+
+    return state_dir() / "refund-held.json"
 
 
 MODEL_USAGE_FILE = "model-usage.jsonl"
@@ -83,17 +85,17 @@ def model_usage_path() -> Path | None:
     raise RuntimeError("LOG_MODEL_USAGE must be 1, true, yes, 0, false, or no")
 
 
-def effect_restart_window_seconds() -> float:
-    raw_value = os.getenv("EFFECT_RESTART_WINDOW_SECONDS", "0")
+def refund_restart_window_seconds() -> float:
+    raw_value = os.getenv("REFUND_RESTART_WINDOW_SECONDS", "0")
     try:
         value = float(raw_value)
     except ValueError as error:
         raise RuntimeError(
-            "EFFECT_RESTART_WINDOW_SECONDS must be a finite number"
+            "REFUND_RESTART_WINDOW_SECONDS must be a finite number"
         ) from error
     if not math.isfinite(value) or value < 0:
         raise RuntimeError(
-            "EFFECT_RESTART_WINDOW_SECONDS must be a finite number, zero or greater"
+            "REFUND_RESTART_WINDOW_SECONDS must be a finite number, zero or greater"
         )
     return value
 

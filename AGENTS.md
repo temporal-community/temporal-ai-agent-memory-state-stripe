@@ -11,18 +11,28 @@ code. It uses the README's four kinds of information, in the README's order:
   agent process in Demo 1 and in the Workflow in Demo 2.
 - **Long-term memory** is what an agent carries from one run to the next, and
   it lives in a store you own. Here that is a light version: `remember_case`
-  saves a case note to the SQLite demo store (`src/refund_agent/store.py`)
-  after the refund, and `lookup_customer_history` reads notes back as
-  `past_cases`. Each stage run starts from fresh seed data.
+  saves a case note to the `case_notes` memory table in the SQLite demo store
+  (`src/refund_agent/store.py`) after the refund, and the agent's
+  `search_memory` tool reads this customer's notes back. Memory is kept apart
+  from the customer records: never return it through a record lookup such as
+  `lookup_customer_history`. Each stage run starts from fresh seed data, so
+  the agent's search shows `Past cases (memory): none yet`. Demo 2's final
+  frame shows the note the new Worker saved (read by Workflow ID with
+  `store.get_case_note`); Demo 1's follow-up shows none, because its process
+  died before the refund. Keep that contrast: memory is written only when the
+  run finishes, so it supports the Temporal point instead of competing with it.
 - **Execution state** is where the work stands, and Temporal records it in
   Event History, which lives in the Temporal Service rather than in the
   Worker.
-- **Effect state** is whether the refund actually happened, and Stripe, or
-  the offline Stripe-like ledger, owns that record.
+- **The refund itself**: Stripe, or the offline Stripe-like ledger, is the
+  source of truth for whether it happened. The `issue_refund` Activity result
+  is the Workflow's record of it, and the idempotency key reconciles the two
+  after a crash. Don't call this "effect state" in docs; the published video
+  labels the Stripe panel "Effect State", and the README notes that once.
 
-Execution state and effect state are authoritative: each is an owner's record
-that grounds what the application may safely do, and it wins when copies
-disagree. Memory is not authoritative, because it says what the agent
+Execution state and Stripe's refund record are authoritative: each is an
+owner's record that grounds what the application may safely do, and it wins
+when copies disagree. Memory is not authoritative, because it says what the agent
 believed, not what happened. These are roles, not storage types: an order row
 in the application database becomes context once the agent looks it up, and
 the order row still wins.
@@ -31,14 +41,18 @@ the order row still wins.
 
 - Nyghtowl starts with a paid python-plushy order. In Stripe test mode, create
   the PaymentIntent before the first refund prompt so `PAID` is a real
-  effect-owner record, not stage decoration.
+  Stripe record, not stage decoration.
 - In Stripe test mode, Demo 1's new agent process must retrieve the
   PaymentIntent and refund list from Stripe. That read must never create a
   refund. In the stage run, only Demo 2 submits a refund.
 - In Demo 1, the agent visibly loops: ask whether the package was opened,
   observe the answer, ask what was damaged, observe the answer, look up the
-  order and refund history, then choose `issue refund` as its next action. The
-  agent process disappears before Stripe is called.
+  order and refund history, search past cases in long-term memory, then
+  choose `issue refund` as its next action. The
+  agent process disappears before Stripe is called. The fixed policy always
+  asks both questions in that order. A live model chooses its own questions
+  (it may ask fewer, or in another order), so the stage must work with zero,
+  one, or two questions in any order and forward whatever Demo 2's agent asks.
 - When Demo 1's agent process dies, its process-local working memory goes with
   it, including Nyghtowl's answers and the loop's next action. Stripe correctly
   keeps `PAID` with no refund, but it does not own the customer intake or the
@@ -48,13 +62,14 @@ the order row still wins.
   Signals, lookups are Activities, and the next action is Workflow state.
   After the kill, a new Worker picks up the Workflow, and the agent resumes at
   `issue refund` without repeating questions or restarting the loop, then
-  says, “Your refund is complete.”
+  says, “Your refund is complete,” without the customer asking, and shows the
+  case note it saved to long-term memory.
 - Do not claim Temporal prevents duplicate refunds by itself. Stripe's
-  idempotency support makes the repeated effect call safe. Temporal records
+  idempotency support makes the repeated refund call safe. Temporal records
   that the refund step hasn't finished and drives it to completion with
   retries; Stripe, not Temporal, owns whether the refund happened.
 - Do not describe Demo 2's run as two refund requests. It is one logical
-  refund operation that may need more than one Activity attempt or effect
+  refund operation that may need more than one Activity attempt or Stripe
   call.
 - Do not claim that each step runs only once. An Activity that was running
   at the crash has no recorded result, so Temporal runs it again. The intended
@@ -72,11 +87,12 @@ the order row still wins.
   Say “new” rather than mixing in “replacement” or “reloaded.” Keep SDK and
   event-history terms in the detailed `refund-demo watch` and inspection
   paths.
-- Label scripted parts on screen. Each demo header carries one dim mode line
+- Label scripted parts on screen. Each demo header carries one mode line
   (scripted steps; fixed policy or live model; sample lookups; Stripe test mode
-  or offline ledger). The reuse of Demo 1's answers and the demo-only wait
-  before Stripe, where the Workflow waits for the `release` Signal, are
-  labeled where they happen. Never label the offline ledger as just “Stripe”:
+  or offline ledger). An offline run's line starts with
+  `OFFLINE: fixed policy, no model calls` in bold yellow, never dim. The reuse
+  of Demo 1's answers and the demo-only hold before Stripe, where the stage's
+  Worker hook holds the refund Activity, are labeled where they happen. Never label the offline ledger as just “Stripe”:
   its heading is `OFFLINE LEDGER (Stripe stand-in)`, and `STRIPE (test mode)`
   appears only with `--real`.
 - Give each stage frame one cue, carried by the input prompt. It says
@@ -92,9 +108,9 @@ the order row still wins.
 - Treat `NO REPEATED QUESTIONS`, `NO LOOP RESTART`, and the customer-facing
   result as the primary payoff: contrast what a memory store could bring back
   with what Temporal records, which is the completed observations and the
-  loop's next action. Do not make a duplicate refund or an uncertain Stripe effect the
-  main payoff. `2 CALLS → 1 REFUND` is supporting evidence about effect safety
-  in the manual technical path, and the post-effect idempotency case belongs
+  loop's next action. Do not make a duplicate refund or an uncertain Stripe refund the
+  main payoff. `2 CALLS → 1 REFUND` is supporting evidence about refund safety
+  in the manual technical path, and the post-refund idempotency case belongs
   in the manual walkthrough
   (`docs/GUIDE.md#later-loss-after-stripe-accepts-the-refund`). Show call
   counts only when there is more than one call (the retry paths); never show a
@@ -104,15 +120,47 @@ the order row still wins.
 
 - Keep Workflow code deterministic. Network calls, model calls, filesystem
   access, and other nondeterministic work belong in Activities.
-- Preserve a stable effect identity across retries. The current implementation
-  derives the Stripe idempotency key from the Workflow run identity.
+- Both demos run one agent loop, `run_agent_loop` in `agent_loop.py`. It does
+  no I/O and takes injected callables (decide, use_tool, ask_customer): the
+  Workflow passes Activities and a Signal wait, and Demo 1 passes direct calls
+  and stdin. Change the loop once, there. Working memory holds one
+  `agent_step` entry per model turn, then the customer answer or tool result
+  that turn produced.
+- The Workflow, `RefundRequest`, and the Activities are what a real app would
+  ship: no prints, no files for the UI, and no demo switches. Activities log
+  with `activity.logger`. The stage follows Demo 2 through the `progress`
+  Query and Event History. Demo machinery stays at the edges:
+  - `demo_hooks.py` is an Activity interceptor that wraps `issue_refund` only.
+    The stage switches it on per Worker with `STAGE_HOLD_REFUND` (hold the
+    refund before Stripe until the Worker is killed) and
+    `STAGE_SIMULATE_STRIPE_TIMEOUT`, and the retry drill and manual
+    walkthrough use `REFUND_RESTART_WINDOW_SECONDS`. A Worker with none set
+    registers no interceptor.
+  - The hook writes `refund-held.json` in the state directory when it holds
+    the refund; the stage waits for it before it kills the Worker.
+  - The fixed offline policy is chosen explicitly with
+    `model_provider="offline"` (`OFFLINE_POLICY`) in the request. The
+    Activity and Demo 1 pick it; `model_next_step` only calls a model and
+    never falls back to it.
+- Preserve a stable refund identity. `issue_refund` derives the Stripe
+  idempotency key from the Workflow ID, the refund's business identity (one
+  refund request = one Workflow ID), so every attempt, a reset, and a new run
+  of the same Workflow ID send the same key. Stripe keeps keys for about 24
+  hours, so a later reset still needs an Stripe check; say so wherever the
+  key is explained. Never derive the key from the Run ID.
 - Keep the stage runner isolated with its private task queue and state
   directory. It must not stop or delete unrelated Workers or user data.
-- Offline deterministic mode is the default stage path. `--real` is Stripe test
+- The live run (a model and Stripe test mode) is the default for
+  `refund-demo stage` and `refund-demo start`. Offline happens only on
+  purpose: `--offline` (`start` also takes `--dry-run`), or Enter at the
+  stage's key prompt. Missing keys with no terminal to ask, or a bad key at
+  the prompt, are errors that say to pass `--offline`. `--real` is Stripe test
   mode only, and live Stripe keys must remain rejected.
 - Live model mode supports Anthropic and OpenAI. Record an explicit provider in
   Workflow input so new Workers cannot switch providers based on key
-  availability.
+  availability. The live model gets no scripted questions; its instructions
+  ask it to collect `item_opened` and `damage` with `ask_customer` when
+  useful. Keep the `question_id` enum.
 - Build the Anthropic and OpenAI clients with `max_retries=0` and a timeout
   shorter than the `agent_decide_next_step` start-to-close timeout, and keep
   `stripe.max_network_retries = 0`. The Temporal Activity retry policy is the
@@ -122,8 +170,9 @@ the order row still wins.
   `issue_refund` start-to-close timeout, and keep `issue_refund` heartbeating
   every second while it waits (`_call_with_heartbeats`). A slow call is then
   not taken for a lost Worker, and a hung one fails and retries with the same
-  idempotency key. The heartbeat timeout is 15 s, or 3 s on the stage's
-  simulated-failure paths.
+  idempotency key. The timeouts are constants in `workflow.py`: heartbeat 5 s
+  (the Worker-loss window, so a new Worker picks up the next attempt within
+  seconds), start-to-close 5 minutes, schedule-to-close 30 minutes.
 - Pass `temporal_identity()` to every Temporal client, so each process reports
   `<pid>@refund-demo` (or `TEMPORAL_IDENTITY` verbatim) and the machine's
   hostname never shows in the Temporal Web UI.
@@ -134,55 +183,62 @@ the order row still wins.
 
 ## Changing the Workflow safely
 
+- This is a demo. Before upgrading the code, finish or terminate any running
+  demo Workflows (`uv run refund-demo stop <workflow-id>`, which cancels; add `--terminate`
+  when no Worker is running, or use Terminate in the Temporal Web UI). The repository doesn't carry compatibility code for runs
+  started by older code: no deprecated request fields, Signals, or Activity
+  signatures kept for old histories, and no `workflow.patched()` guards. Don't
+  add them; change the code and re-record the replay history instead.
 - Workflow code must stay deterministic. A new Worker rebuilds a run by
   replaying its Event History, which means it runs the Workflow code again from
   the top and checks each step against what the history recorded.
 - A change to the order or kind of Commands breaks replay of runs that are
   already in flight. Commands come from steps such as starting an Activity,
   starting a timer, or starting a child Workflow. Moving where the Workflow
-  waits for a Signal also changes which Commands come next.
-- Guard such a change with `workflow.patched("<change-id>")`, so runs that
-  started before the change keep the old path. After every run that took the
-  old path has finished, delete the old path and replace the guard with
-  `workflow.deprecate_patch("<change-id>")`. Remove that call once every run
-  that recorded the patch has finished. Worker Versioning is the other option:
-  it can pin runs that started on the old code to Workers that still run that
-  code.
+  waits for a Signal also changes which Commands come next. In a production
+  app you would guard such a change with `workflow.patched("<change-id>")` or
+  use Worker Versioning; here, finish or terminate demo runs first, as above.
 - Run `make test` before merging. It includes `tests/test_replay.py`, which
-  replays the saved history in `tests/histories/stage_offline.json` against
-  the current Workflow code.
-- When a change is intentional and patched, the existing
-  `tests/histories/stage_offline.json` must still replay, which shows that the
-  patch works. To cover the new path too, regenerate the history as the
-  docstring of `tests/test_replay.py` describes. If runs recorded with the old
-  code must still replay, keep the old history file under a new name and have
-  the test replay both. Replace it outright only when you mean to drop support
-  for those runs.
+  replays `tests/histories/stage_offline_worker_hooks.json`, an offline stage
+  run recorded from the current code, against the current Workflow.
+- When a change alters the Workflow's Commands on purpose, re-record that
+  history as the docstring of `tests/test_replay.py` describes and replace the
+  file. If the replay test fails after a change you didn't mean to alter the
+  Commands, fix the change, not the history.
 
 ## Important paths
 
 - `src/refund_agent/stage.py`: guided single-terminal talk path
-- `src/refund_agent/store.py`: the SQLite demo store the lookups read and
-  `remember_case` writes; it stands in for the business systems and a memory
-  store
+- `src/refund_agent/store.py`: the SQLite demo store. Its record tables
+  (orders, customers) stand in for the business systems the lookups read; its
+  `case_notes` table is the agent's long-term memory, which `remember_case`
+  writes and `search_memory` reads, kept apart from the records
 - `src/refund_agent/tui.py`: technical and general-audience panels
-- `src/refund_agent/workflow.py`: Demo 2's agent loop (the
-  `RefundApprovalAgent` Workflow) and its Activity boundary
-- `src/refund_agent/activities/`: the Activities, split by role. `model.py` holds
-  the model turn and usage logging, `tools.py` the three lookups and the
-  `remember_case` memory write, `refund.py`
-  the refund side effect and its idempotency key, and `view.py` the display
-  helpers. Activity names must not change: Event History and
-  `tests/test_replay.py` refer to them by name.
+- `src/refund_agent/agent_loop.py`: the agent loop both demos run, with its
+  turn budget and the allowed questions and tools
+- `src/refund_agent/workflow.py`: Demo 2 (the `RefundApprovalAgent`
+  Workflow): the loop's Activities and Signal wait, approval, the refund, the
+  `progress` Query, and the `approve` and `customer_answer` Signals
+- `src/refund_agent/activities/`: the Activities, split by role. `model.py`
+  holds the model turn (`model_next_step`), the fixed offline policy
+  (`fixed_policy_step`), and usage logging, `tools.py` the three lookups,
+  the `search_memory` memory read, and the `remember_case` memory write, and
+  `refund.py` the refund side effect (`refund_payment`, shared with Demo 1)
+  and its idempotency key. Activity names are what Event History and
+  `tests/test_replay.py` refer to; renaming one means re-recording the replay
+  history.
+- `src/refund_agent/demo_hooks.py`: the demo-only Activity interceptor for the
+  stage's hold before Stripe and its failure drills
 - `src/refund_agent/naive_refund.py`: Demo 1's agent process, the comparison
-  without Temporal
+  without Temporal. It runs the shared loop with direct calls and stdin and
+  refunds through `refund_payment` into the same offline ledger
 - `src/refund_agent/fake_stripe.py`: the offline ledger (the Stripe stand-in)
   and its call counter
 - `README.md`: what the demo shows, how to run it, the four kinds of
   information and who owns each fact (`#memory-and-execution-state`),
   architecture, cost, and how other approaches compare
 - `docs/GUIDE.md`: stage flags, Web UI checks, expected output, the manual
-  walkthrough, the authorization companion demo, and every error
+  walkthrough, and every error
 - `docs/HISTORY_GROWTH.md`: Event History growth, claim check, and
   Continue-As-New
 - `docs/TALK_10_MIN.md`: canonical talk timing, wording, and controls
@@ -218,6 +274,12 @@ Changes to stage copy or control flow also require a complete offline rehearsal
 uv run refund-demo stage --offline
 ```
 
+Without a terminal, `yes '' | uv run refund-demo stage --offline` presses
+Enter at every prompt and plays the whole run; add `--simulate-stripe-timeout`
+or `--simulate-stripe-retry` for the drills. It still starts a local Temporal
+dev server if none is reachable, so point `TEMPORAL_ADDRESS` at a throwaway
+server as `tests/test_replay.py` describes.
+
 Verify the content is visible at the intended terminal size, not merely present
 in the Rich render tree. The smallest stage terminal is 80 columns, and the
 recording width is 100 to 120 columns (`tests/test_tui.py` checks 80 and 100).
@@ -234,8 +296,8 @@ longest line at those widths, not only at 128, the width
     the concepts, architecture, cost, how other approaches compare, gotchas,
     and what the demo is not. It uses no presenter language.
   - `docs/GUIDE.md` is for whoever runs or presents the demo. It owns the
-    stage flags, Web UI checks, expected output, the manual walkthrough, the
-    authorization companion demo, and troubleshooting.
+    stage flags, Web UI checks, expected output, the manual walkthrough, and
+    troubleshooting.
   - `docs/TALK_10_MIN.md` is the presenter's run of show, which the presenter
     only glances at while speaking. It owns the talk's timing, wording, and
     controls.

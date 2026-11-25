@@ -1,18 +1,22 @@
 """Demo 1: an autonomous loop without durable execution state.
 
 The agent asks questions, observes answers, performs lookups, and chooses its
-next action. Its Worker then disappears before calling the refund system. Its
-process-local working memory disappears too. Stripe correctly retains the paid
-charge with no refund, but it does not own the interrupted agent loop.
+next action. Its agent process then disappears before calling the refund
+system. Its process-local working memory disappears too. Stripe correctly
+retains the paid charge with no refund, but it does not own the interrupted
+agent loop.
 
-Each turn calls the same decide_next_step as Demo 2's agent_decide_next_step
-Activity, in this process with no Temporal: fixed policy by default, or the
-live model with --real-model.
+It runs the same agent loop as Demo 2 (agent_loop.py), in this process with no
+Temporal: direct calls instead of Activities and stdin instead of Signals.
+Each turn uses the fixed offline policy by default, or the same live model step
+with --real-model. A refund goes through the same refund_payment call as Demo
+2's issue_refund Activity.
 """
 
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import os
 import sys
@@ -25,22 +29,36 @@ import stripe
 
 from refund_agent.activities import (
     TOOL_HISTORY,
+    TOOL_MEMORY,
     TOOL_ORDER,
     TOOL_POLICY,
     USAGE_AGENT_NAIVE,
     _selected_model_provider,
     check_refund_policy,
-    decide_next_step,
+    fixed_policy_step,
     lookup_customer_history,
     lookup_order,
+    model_next_step,
+    refund_payment,
+    search_memory,
 )
-from refund_agent.models import AgentStep, RefundRequest
+from refund_agent.activities.tools import MEMORY_LABEL, past_cases_summary
+from refund_agent.agent_loop import run_agent_loop
+from refund_agent.fake_stripe import (
+    forget_refunds,
+    idempotency_key_for,
+    refunds_for_payment_intent,
+)
+from refund_agent.models import OFFLINE_POLICY, AgentStep, RefundDecision, RefundRequest
 from refund_agent.settings import load_env_file, validate_stripe_key
-from refund_agent.workflow import MAX_TURNS
 
 # Color only when writing to a real terminal, so piped output stays clean.
 _COLOR = sys.stdout.isatty()
 _CODES = {"bold": "1", "dim": "2", "system": "32", "danger": "31"}
+
+
+# The demo customer, the same one Demo 2 serves.
+_NAIVE_CUSTOMER_ID = "cus_demo_42"
 
 
 def paint(text: str, name: str) -> str:
@@ -67,25 +85,14 @@ def _state_dir() -> Path:
     return Path(os.getenv("DEMO_STATE_DIR", ".demo-state"))
 
 
-def _ledger_path() -> Path:
-    return _state_dir() / "naive-ledger.json"
-
-
 def _done_path(order: str) -> Path:
     return _state_dir() / f"naive-done-{order}.json"
-
-
-def _read_ledger() -> dict:
-    path = _ledger_path()
-    if not path.exists():
-        return {"refunds": []}
-    return json.loads(path.read_text(encoding="utf-8"))
 
 
 def _read_real_stripe_state(
     payment_intent_id: str,
 ) -> tuple[str, list[dict[str, object]]]:
-    """Read effect state from Stripe without creating a refund."""
+    """Read the payment and its refunds from Stripe without creating a refund."""
 
     stripe.api_key = validate_stripe_key(os.getenv("STRIPE_API_KEY"), required=True)
     stripe.max_network_retries = 0
@@ -105,26 +112,18 @@ def _read_real_stripe_state(
     return payment_status, ledger
 
 
-def _append_refund(order: str, amount_cents: int) -> str:
-    # The effect owner accepts a new refund call. The caller checks existing
-    # effect state before reaching this function, but that check is still manual
-    # reconciliation rather than resumed execution.
-    ledger = _read_ledger()
-    refund_id = f"re_naive_{uuid.uuid4().hex[:12]}"
-    ledger["refunds"].append(
-        {"refund_id": refund_id, "order_id": order, "amount_cents": amount_cents}
-    )
-    _ledger_path().write_text(
-        json.dumps(ledger, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-    )
-    return refund_id
+def _offline_refunds(payment_intent_id: str) -> list[dict[str, object]]:
+    """Refunds the offline ledger (the Stripe stand-in) holds for this payment."""
 
-
-def _existing_refund(order: str) -> dict | None:
-    return next(
-        (refund for refund in _read_ledger()["refunds"] if refund["order_id"] == order),
-        None,
-    )
+    return [
+        {
+            "refund_id": str(refund["refund_id"]),
+            "order": "1234",
+            "amount": int(refund["amount_cents"]),
+            "status": str(refund.get("status", "succeeded")).lower(),
+        }
+        for refund in refunds_for_payment_intent(payment_intent_id)
+    ]
 
 
 def _naive_request(args: argparse.Namespace) -> RefundRequest:
@@ -133,27 +132,24 @@ def _naive_request(args: argparse.Namespace) -> RefundRequest:
     request = RefundRequest(
         request_id=f"naive-{uuid.uuid4().hex[:8]}",
         order_id=f"order-{args.order}",
-        customer_id="cus_demo_42",
+        customer_id=_NAIVE_CUSTOMER_ID,
         payment_intent_id=args.payment_intent,
         amount_cents=args.amount_cents,
         reason=args.reason,
         dry_run=not args.real,
+        # No answers up front, so the agent may ask for them.
         item_opened=None,
         damage=None,
-        interactive_questions=True,
-        hold_before_effect=args.hold_before_effect,
-        use_canned_agent=not args.real_model,
-        model_provider=args.model_provider,
+        # Offline is chosen explicitly; --real-model never falls back to it.
+        model_provider=args.model_provider if args.real_model else OFFLINE_POLICY,
     )
-    # Offline, decide_next_step falls back to the fixed policy when no provider
-    # is configured. --real-model promises the live model, so fail instead.
     if args.real_model and _selected_model_provider(request) is None:
         raise RuntimeError("--real-model requires ANTHROPIC_API_KEY or OPENAI_API_KEY")
     return request
 
 
-def _lookup(tool: str | None, request: RefundRequest) -> dict:
-    # The same store and dispatch as RefundWorkflow._run_tool, run in this
+def _lookup(tool: str, request: RefundRequest) -> dict:
+    # The same store and dispatch as RefundWorkflow._use_tool, run in this
     # process: no Activity, so nothing is recorded outside it.
     if tool == TOOL_ORDER:
         return asdict(lookup_order(request.order_id))
@@ -161,6 +157,8 @@ def _lookup(tool: str | None, request: RefundRequest) -> dict:
         return asdict(lookup_customer_history(request.customer_id))
     if tool == TOOL_POLICY:
         return asdict(check_refund_policy(request.order_id))
+    if tool == TOOL_MEMORY:
+        return asdict(search_memory(request.customer_id))
     raise RuntimeError(f"agent asked for an unknown tool: {tool}")
 
 
@@ -170,89 +168,87 @@ def _tool_event(tool: str, result: dict) -> dict[str, str]:
         label, shown = "Order", str(result.get("item") or "python plushy")
     elif tool == TOOL_HISTORY:
         label, shown = "Refund history", "clean"
+    elif tool == TOOL_MEMORY:
+        label, shown = MEMORY_LABEL, past_cases_summary(result)
     else:
         label = "Refund policy"
         shown = "eligible" if result.get("eligible_for_refund") else "not eligible"
     return {"kind": "tool", "tool": tool, "label": label, "result": shown}
 
 
-def _run_interactive_agent_loop(request: RefundRequest) -> AgentStep:
-    """Run Demo 2's loop in process until the agent decides.
+def _run_interactive_agent_loop(request: RefundRequest) -> RefundDecision:
+    """Run Demo 2's loop in this process until the agent decides.
 
-    Code asks the two intake questions; the fixed policy or the live model picks
-    the lookups and the decision. The answers, observations, and next action
-    live only in this process.
+    The fixed policy or the live model asks the questions it needs, picks the
+    lookups, and decides. The answers, observations, and next action live only
+    in this process.
     """
 
+    async def decide(request: RefundRequest, working_memory: list[dict]) -> AgentStep:
+        # The offline policy is an explicit choice in the request, as in the
+        # agent_decide_next_step Activity.
+        if request.model_provider == OFFLINE_POLICY:
+            return fixed_policy_step(request, working_memory)
+        return model_next_step(request, working_memory, agent=USAGE_AGENT_NAIVE)
+
+    async def use_tool(tool: str) -> dict:
+        result = _lookup(tool, request)
+        _loop_event(_tool_event(tool, result))
+        return result
+
+    async def ask_customer(step: AgentStep) -> str:
+        question_id = step.question_id or ""
+        question = step.question or question_id
+        suggested_answer = step.suggested_answer or ""
+        _loop_event(
+            {
+                "kind": "question",
+                "question_id": question_id,
+                "question": question,
+                "suggested_answer": suggested_answer,
+            }
+        )
+        line = sys.stdin.readline()
+        if not line:
+            raise RuntimeError("customer input closed during the agent loop")
+        answer = line.strip() or suggested_answer
+        _loop_event(
+            {
+                "kind": "answer",
+                "question_id": question_id,
+                "question": question,
+                "result": answer,
+            }
+        )
+        return answer
+
     working_memory: list[dict] = []
-    answers: dict[str, str] = {}
-    for _turn in range(MAX_TURNS):
-        step = decide_next_step(request, working_memory, agent=USAGE_AGENT_NAIVE)
-        if step.action == "decide":
-            recommendation = step.recommendation or "escalate"
-            _line("MODEL REASONING", f"decide -> {recommendation} ({step.rationale})")
-            # Demo 2's stage runner approves an escalation, so this loop treats
-            # one the same way; only a denial leaves no refund to issue.
-            _loop_event(
-                {
-                    "kind": "ready",
-                    "label": "Next action",
-                    "result": "no refund"
-                    if recommendation == "deny"
-                    else "issue refund",
-                    "recommendation": recommendation,
-                }
-            )
-            return step
-        if step.action == "ask_customer":
-            question_id = step.question_id or ""
-            if question_id not in {"item_opened", "damage"}:
-                raise RuntimeError(
-                    f"agent asked an unsupported question: {question_id}"
-                )
-            if question_id not in answers:
-                question = step.question or question_id
-                suggested_answer = step.suggested_answer or ""
-                _loop_event(
-                    {
-                        "kind": "question",
-                        "question_id": question_id,
-                        "question": question,
-                        "suggested_answer": suggested_answer,
-                    }
-                )
-                answer = sys.stdin.readline()
-                if not answer:
-                    raise RuntimeError("customer input closed during the agent loop")
-                answers[question_id] = answer.strip() or suggested_answer
-                _loop_event(
-                    {
-                        "kind": "answer",
-                        "question_id": question_id,
-                        "question": question,
-                        "result": answers[question_id],
-                    }
-                )
-            # As in the Workflow, a repeated question reuses the earlier answer.
-            working_memory.append(
-                {
-                    "tool": "customer_answer",
-                    "question": question,
-                    "result": {
-                        "question_id": question_id,
-                        "answer": answers[question_id],
-                    },
-                }
-            )
-            continue
-        result = _lookup(step.tool, request)
-        working_memory.append({"tool": step.tool, "result": result})
-        _loop_event(_tool_event(str(step.tool), result))
-    raise RuntimeError("agent did not reach a decision within the turn budget")
+    decision = asyncio.run(
+        run_agent_loop(
+            request,
+            working_memory,
+            decide=decide,
+            use_tool=use_tool,
+            ask_customer=ask_customer,
+        )
+    )
+    recommendation = decision.recommendation
+    _line("MODEL REASONING", f"decide -> {recommendation} ({decision.rationale})")
+    # Demo 2's stage runner approves an escalation, so this loop treats one the
+    # same way; only a denial leaves no refund to issue.
+    _loop_event(
+        {
+            "kind": "ready",
+            "label": "Next action",
+            "result": "no refund" if recommendation == "deny" else "issue refund",
+            "recommendation": recommendation,
+        }
+    )
+    return decision
 
 
 def _replacement_status(args: argparse.Namespace) -> None:
-    """Run the replacement agent's effect check in a new process."""
+    """Run the replacement agent's Stripe check in a new process."""
 
     _state_dir().mkdir(parents=True, exist_ok=True)
     question = sys.stdin.readline()
@@ -264,15 +260,7 @@ def _replacement_status(args: argparse.Namespace) -> None:
             payment_status, refunds = _read_real_stripe_state(args.payment_intent)
         else:
             payment_status = "PAID"
-            refunds = [
-                {
-                    "refund_id": str(refund["refund_id"]),
-                    "order": str(refund["order_id"]),
-                    "amount": int(refund["amount_cents"]),
-                    "status": "succeeded",
-                }
-                for refund in _read_ledger().get("refunds", [])
-            ]
+            refunds = _offline_refunds(args.payment_intent)
     except stripe.StripeError as error:
         message = getattr(error, "user_message", None) or str(error)
         _line("AGENT ERROR", json.dumps({"message": message}))
@@ -286,9 +274,12 @@ def _replacement_status(args: argparse.Namespace) -> None:
         },
         "_status_checked": True,
         "_refund_missing": not refunds,
+        # The same search_memory read Demo 2's agent uses. The old process
+        # died before the refund, so it never saved a case note.
+        "_past_cases": len(search_memory(_NAIVE_CUSTOMER_ID).past_cases),
         "_payment_status": payment_status,
-        "_replacement_worker": True,
-        "_worker_pid": os.getpid(),
+        "_new_process": True,
+        "_process_pid": os.getpid(),
         "note": "replacement process checked Stripe after the customer asked",
         "user_message": question.strip(),
     }
@@ -308,26 +299,29 @@ def _refund(args: argparse.Namespace) -> None:
     _state_dir().mkdir(parents=True, exist_ok=True)
 
     print(paint("=" * 64, "dim"))
-    # Domain facts are retrieved into MEMORY on every new run. The source record
-    # remains domain state; this is the copy the agent reasons with.
-    _line("CONTEXT", f"order {order}, {_money(amount)}, customer cus_demo_42")
-    _line("MEMORY COPY", "cus_demo_42: 824 days tenure, 1 prior refund")
+    _line("CONTEXT", f"order {order}, {_money(amount)}, customer {_NAIVE_CUSTOMER_ID}")
 
-    # The completion marker is separate from the effect. It can be durable after
+    # The completion marker is separate from the refund. It can be durable after
     # it is written and still cannot close the crash gap before that write.
     if _done_path(order).exists():
         _line("PROGRESS RECORD", "completion marker found; already refunded, done")
         return
     _line(
         "PROGRESS RECORD",
-        "no marker; cannot infer whether the external effect committed",
+        "no marker; cannot infer whether the refund reached Stripe",
     )
 
-    existing = _existing_refund(order)
-    if existing is not None:
+    request = _naive_request(args)
+    # Manual reconciliation: ask Stripe, the source of truth, whether this
+    # payment already has a refund. It is a read, never a refund call.
+    if args.real:
+        _, existing = _read_real_stripe_state(args.payment_intent)
+    else:
+        existing = _offline_refunds(args.payment_intent)
+    if existing:
         _line(
-            "EFFECT CHECK",
-            f"refund system confirms {existing['refund_id']} already succeeded",
+            "STRIPE CHECK",
+            f"refund system confirms {existing[0]['refund_id']} already exists",
         )
         _line(
             "RECOVERY",
@@ -335,10 +329,10 @@ def _refund(args: argparse.Namespace) -> None:
         )
         return
 
-    decision: AgentStep | None = None
+    decision: RefundDecision | None = None
     if args.interactive_loop:
         try:
-            decision = _run_interactive_agent_loop(_naive_request(args))
+            decision = _run_interactive_agent_loop(request)
         except Exception as error:
             # One readable line for the stage instead of a traceback it ignores.
             _line("AGENT ERROR", json.dumps({"message": str(error)}))
@@ -353,12 +347,12 @@ def _refund(args: argparse.Namespace) -> None:
         # Nothing to hold before: a denial issues no refund.
         _line("THE SYSTEM", f"no refund issued for order {order}")
         return
-    if args.hold_before_effect:
+    if args.hold_before_refund:
         # Demo-only pause, at the same point as Demo 2's: hold before calling
         # Stripe so the stage can kill this process there every run.
         _line(
             "REQUEST BUFFER",
-            "next action held by this Worker; Stripe not called",
+            "next action held by this agent process; Stripe not called",
         )
         sys.stdout.flush()
         while True:
@@ -366,10 +360,29 @@ def _refund(args: argparse.Namespace) -> None:
 
     if decision is None:
         _line("MODEL REASONING", "approve (amount within policy, clean history)")
-    refund_id = _append_refund(order, amount)
-    _line("THE SYSTEM", f"issued refund {refund_id} for order {order}")
+    # The same refund call as Demo 2's issue_refund Activity. With no Workflow
+    # run to derive it from, the idempotency key comes from this process's
+    # request id, so a new process would send a new key: the reason for the
+    # Stripe check above.
+    stripe_refund, _mode = refund_payment(
+        request,
+        workflow_id=request.request_id,
+        idempotency_key=idempotency_key_for(request.request_id),
+    )
+    refund_id = str(stripe_refund["refund_id"])
+    status = str(stripe_refund.get("status") or "unknown").lower()
+    _line("THE SYSTEM", f"issued refund {refund_id} for order {order}: {status}")
+    # An accepted call is not a completed refund. Only Stripe's `succeeded`
+    # counts as done; anything else (pending, failed) is shown as-is and no
+    # completion marker is written.
+    if status != "succeeded":
+        _line(
+            "PROGRESS RECORD",
+            f"refund {status}, not complete; no completion recorded",
+        )
+        return
 
-    if args.hold_after_effect:
+    if args.hold_after_refund:
         _line(
             "PROGRESS RECORD",
             "refund succeeded; waiting before recording completion",
@@ -378,7 +391,7 @@ def _refund(args: argparse.Namespace) -> None:
         while True:
             time.sleep(60)
 
-    if args.exit_after_effect:
+    if args.exit_after_refund:
         _line(
             "PROGRESS RECORD",
             paint("process exits before recording completion", "danger"),
@@ -394,24 +407,79 @@ def _refund(args: argparse.Namespace) -> None:
 
 
 def _ledger(args: argparse.Namespace) -> None:
-    ledger = _read_ledger()
+    # Demo 1's refunds live in the same offline ledger as Demo 2's; its
+    # Workflow-ID field holds the naive request id instead.
     refunds = [
-        r for r in ledger["refunds"] if not args.order or r["order_id"] == args.order
+        refund
+        for refund in refunds_for_payment_intent(args.payment_intent)
+        if str(refund.get("workflow_id", "")).startswith("naive-")
     ]
-    print(paint(f"naive ledger: {len(refunds)} refund(s)", "bold"))
+    print(paint(f"offline ledger, Demo 1 refunds: {len(refunds)}", "bold"))
     for refund in refunds:
-        detail = (
-            f"{refund['refund_id']}  order {refund['order_id']}  "
-            f"{_money(refund['amount_cents'])}"
-        )
+        detail = f"{refund['refund_id']}  {_money(int(refund['amount_cents']))}"
         _line("THE SYSTEM", detail)
 
 
 def _reset(_args: argparse.Namespace) -> None:
-    _ledger_path().unlink(missing_ok=True)
+    removed = forget_refunds("naive-")
     for path in _state_dir().glob("naive-done-*.json"):
         path.unlink(missing_ok=True)
-    print(paint("naive ledger and completion records cleared", "dim"))
+    print(
+        paint(
+            f"cleared {removed} Demo 1 refund(s) from the offline ledger and the "
+            "completion records",
+            "dim",
+        )
+    )
+
+
+# The answers the interactive view's customer gives when the agent asks.
+_INTERACTIVE_ANSWERS = {"item_opened": "Yes", "damage": "Split seam"}
+
+
+def _offline_loop_steps(order: str, amount_cents: int) -> list[dict[str, str]]:
+    """Run the shared loop with the fixed offline policy and return its steps.
+
+    The same loop and lookups as the stage, so this view shows what the agent
+    actually asked and looked up, not a fixed list.
+    """
+
+    request = RefundRequest(
+        request_id=f"naive-{uuid.uuid4().hex[:8]}",
+        order_id=f"order-{order}",
+        customer_id=_NAIVE_CUSTOMER_ID,
+        payment_intent_id="pi_dry_run_demo",
+        amount_cents=amount_cents,
+        reason=f"Please refund order {order}.",
+        dry_run=True,
+        item_opened=None,
+        damage=None,
+        model_provider=OFFLINE_POLICY,
+    )
+    steps: list[dict[str, str]] = []
+
+    async def decide(request: RefundRequest, working_memory: list[dict]) -> AgentStep:
+        return fixed_policy_step(request, working_memory)
+
+    async def use_tool(tool: str) -> dict:
+        result = _lookup(tool, request)
+        steps.append(_tool_event(tool, result))
+        return result
+
+    async def ask_customer(step: AgentStep) -> str:
+        question_id = step.question_id or ""
+        answer = _INTERACTIVE_ANSWERS.get(question_id, step.suggested_answer or "")
+        steps.append({"kind": "answer", "question_id": question_id, "result": answer})
+        return answer
+
+    decision = asyncio.run(
+        run_agent_loop(
+            request, [], decide=decide, use_tool=use_tool, ask_customer=ask_customer
+        )
+    )
+    next_action = "no refund" if decision.recommendation == "deny" else "issue refund"
+    steps.append({"kind": "ready", "label": "Next action", "result": next_action})
+    return steps
 
 
 def _process_interactive(
@@ -419,36 +487,17 @@ def _process_interactive(
 ) -> None:
     # This interactive fixture keeps progress in process to make the loss
     # visible. The scripted path above demonstrates the broader crash gap between
-    # an effect and a separate completion write.
+    # the refund and a separate completion write.
     order, amount, customer = "1234", 8000, "42"
     agent["user_message"] = user_message
     agent["context"] = {"order": order, "amount": amount, "customer": customer}
-    agent["memory"] = {"tenure_days": 824, "prior_refunds": 1}
     normalized = user_message.lower()
     if any(word in normalized for word in ("did i", "what happened", "status")):
         agent["_status_checked"] = True
         agent["_refund_missing"] = not any(item["order"] == order for item in ledger)
         agent["note"] = "checked Stripe after a new customer message"
         return
-    agent["_loop_steps"] = [
-        {
-            "kind": "answer",
-            "question_id": "item_opened",
-            "result": "Yes",
-        },
-        {"kind": "answer", "question_id": "damage", "result": "Split seam"},
-        {
-            "kind": "tool",
-            "label": "Order",
-            "result": "python plushy",
-        },
-        {
-            "kind": "tool",
-            "label": "Refund history",
-            "result": "clean",
-        },
-        {"kind": "ready", "label": "Next action", "result": "issue refund"},
-    ]
+    agent["_loop_steps"] = _offline_loop_steps(order, amount)
     agent["note"] = "agent chose the refund; loop position remains in this process"
 
 
@@ -474,7 +523,7 @@ def _demo_frame(
     # it is not a Temporal Worker.
     left = Text()
     if "context" not in agent:
-        if agent.get("_worker_gone"):
+        if agent.get("_process_gone"):
             left.append("PROCESS GONE\n\n", style="bold red")
             left.append(
                 "It held the answers and next step.\n\nThey are gone with it.\n\n",
@@ -497,6 +546,13 @@ def _demo_frame(
         left.append("YOU\n", style="bold yellow")
         left.append(f"  {agent.get('user_message', 'What happened to my refund?')}\n\n")
         left.append("AGENT\n", style="bold cyan")
+        if "_past_cases" in agent:
+            count = int(agent["_past_cases"])
+            if count == 0:
+                left.append("  ✓ Past cases (memory): none\n", style="green")
+                left.append("    nothing saved; the process died first\n", style="dim")
+            else:
+                left.append(f"  ✓ Past cases (memory): {count}\n", style="green")
         left.append("  Let me check Stripe.\n")
         if agent.get("_refund_missing", not ledger):
             left.append("  No refund request reached Stripe.\n", style="bold")
@@ -530,7 +586,7 @@ def _demo_frame(
     right = Text()
     right.append("LAST ORDER\n", style="bold")
     right.append("  Python plushy · $80.00\n\n")
-    right.append(f"{setup.effect_heading}\n", style="bold green")
+    right.append(f"{setup.ledger_heading}\n", style="bold green")
     right.append(f"  Payment: {agent.get('_payment_status', 'PAID')}\n")
     if not ledger:
         right.append("  Refund: none\n", style="dim")
@@ -555,7 +611,7 @@ def _demo_frame(
     )
     # The left pane says what is gone; this panel says what is left. Stripe's
     # record is correct, and it never received or lost a refund request here.
-    if agent.get("_worker_gone"):
+    if agent.get("_process_gone"):
         explanation = (
             "Only Stripe's record: PAID, no refund.\n"
             "That is correct. Stripe was never called."
@@ -584,10 +640,10 @@ def _demo_frame(
         title=explanation_title,
         border_style="yellow",
     )
-    if agent.get("_worker_gone"):
+    if agent.get("_process_gone"):
         agent_panel_title = "AGENT PROCESS"
         agent_border_style = "red"
-    elif agent.get("_replacement_worker") or agent.get("_restarted"):
+    elif agent.get("_new_process") or agent.get("_restarted"):
         agent_panel_title = "NEW AGENT PROCESS"
         agent_border_style = "cyan"
     else:
@@ -679,8 +735,8 @@ def main() -> None:
     refund.add_argument(
         "--real",
         action="store_true",
-        help="mark the request as Stripe test mode, as Demo 2's is; this "
-        "process never calls Stripe",
+        help="use Stripe test mode, as Demo 2 does; the stage stops this process "
+        "before any refund call",
     )
     refund.add_argument(
         "--real-model",
@@ -694,29 +750,33 @@ def main() -> None:
     )
     boundary = refund.add_mutually_exclusive_group()
     boundary.add_argument(
-        "--hold-before-effect",
+        "--hold-before-refund",
         action="store_true",
         help="wait after choosing the refund but before calling the refund system",
     )
     boundary.add_argument(
-        "--exit-after-effect",
+        "--exit-after-refund",
         action="store_true",
         help="exit right after refunding, before recording completion",
     )
     boundary.add_argument(
-        "--hold-after-effect",
+        "--hold-after-refund",
         action="store_true",
         help="wait after refunding so the process can be replaced at the boundary",
     )
 
-    ledger = commands.add_parser("ledger", help="show the naive ledger")
-    ledger.add_argument("--order")
+    ledger = commands.add_parser(
+        "ledger", help="show Demo 1's refunds in the offline ledger"
+    )
+    ledger.add_argument("--payment-intent", default="pi_dry_run_demo")
 
-    commands.add_parser("reset", help="clear the ledger and completion records")
+    commands.add_parser(
+        "reset", help="clear Demo 1's offline refunds and completion records"
+    )
 
     replacement = commands.add_parser(
         "replacement-status",
-        help="check effect state from a new naive-agent process",
+        help="check Stripe for the refund from a new Demo 1 agent process",
     )
     replacement.add_argument("--order", default="1234")
     replacement.add_argument("--amount-cents", type=int, default=8000)

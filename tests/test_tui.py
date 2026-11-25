@@ -8,6 +8,7 @@ import pytest
 pytest.importorskip("rich")
 
 from rich.console import Console
+from rich.text import Text
 from temporalio.api.common.v1 import ActivityType, Payloads
 from temporalio.api.history.v1 import (
     ActivityTaskCompletedEventAttributes,
@@ -27,6 +28,12 @@ _CACHED_STEPS = [
     {"kind": "answer", "question_id": "damage", "result": "Split seam"},
     {"kind": "tool", "label": "Order", "result": "python plushy"},
     {"kind": "tool", "label": "Refund history", "result": "clean"},
+    {
+        "kind": "tool",
+        "tool": "search_memory",
+        "label": "Past cases (memory)",
+        "result": "none yet",
+    },
     {"kind": "ready", "label": "Next action", "result": "issue refund"},
 ]
 
@@ -94,6 +101,8 @@ def _recorded_loop(
     activity("lookup_order", {"item": "python plushy"})
     agent_turn(action="use_tool", tool="lookup_customer_history")
     activity("lookup_customer_history", {"prior_refunds": []})
+    agent_turn(action="use_tool", tool="search_memory")
+    activity("search_memory", {"customer_id": "cus_demo_42", "past_cases": []})
     agent_turn(action="decide", recommendation=recommendation)
     if approved:
         events.append(
@@ -136,7 +145,7 @@ def test_agent_panel_starts_with_same_invitation_as_naive_demo(
     panel = tui._agent_panel("new-refund")
 
     assert "How can I help you?" in panel.renderable.plain
-    assert "no context assembled; no memory retrieved" in panel.renderable.plain
+    assert "no context assembled yet" in panel.renderable.plain
 
 
 def test_lost_agent_panel_points_to_durable_owners(monkeypatch) -> None:
@@ -146,7 +155,7 @@ def test_lost_agent_panel_points_to_durable_owners(monkeypatch) -> None:
 
     assert "LOST" in panel.renderable.plain
     assert "Temporal still owns execution progress" in panel.renderable.plain
-    assert "effect owner still owns the refund outcome" in panel.renderable.plain
+    assert "Stripe is still the source of truth" in panel.renderable.plain
 
 
 def test_stage_agent_returns_without_chat_history(tmp_path, monkeypatch) -> None:
@@ -203,9 +212,15 @@ def test_saved_loop_is_rebuilt_from_temporal_history() -> None:
         "answer",
         "tool",
         "tool",
+        "tool",
         "ready",
     ]
     assert [step["result"] for step in steps[:2]] == ["Yes", "Split seam"]
+    # The memory result is decoded from history, so an empty one reads "none yet".
+    assert (steps[-2]["label"], steps[-2]["result"]) == (
+        "Past cases (memory)",
+        "none yet",
+    )
     assert steps[-1]["result"] == "issue refund"
 
 
@@ -243,7 +258,7 @@ def test_history_next_action_mirrors_the_workflow_decision(
     assert ("ready" in [step["kind"] for step in steps]) is ready
 
 
-def test_worker_gone_panel_reads_the_loop_from_history_not_the_cache(
+def test_process_gone_panel_reads_the_loop_from_history_not_the_cache(
     tmp_path, monkeypatch
 ) -> None:
     monkeypatch.setenv("DEMO_STATE_DIR", str(tmp_path))
@@ -266,13 +281,13 @@ def test_worker_gone_panel_reads_the_loop_from_history_not_the_cache(
     assert "Saved so far:" not in text
     assert "Agent loop saved." not in text
     assert "Customer answers: 2" in text
-    assert "Completed lookups: 2" in text
+    assert "Completed lookups: 3" in text
     assert "Next action: issue refund" in text
     assert "(demo pauses here, before Stripe)" not in text
     assert "earlier reading" not in text
 
 
-def test_worker_gone_panel_labels_the_cached_fallback_when_history_hangs(
+def test_process_gone_panel_labels_the_cached_fallback_when_history_hangs(
     tmp_path, monkeypatch
 ) -> None:
     monkeypatch.setenv("DEMO_STATE_DIR", str(tmp_path))
@@ -300,7 +315,7 @@ def test_worker_gone_panel_labels_the_cached_fallback_when_history_hangs(
     assert "Customer answers: 2" in text
 
 
-def test_worker_gone_frame_with_history_label_fits_the_stage_width(
+def test_process_gone_frame_with_history_label_fits_the_stage_width(
     tmp_path, monkeypatch
 ) -> None:
     monkeypatch.setenv("DEMO_STATE_DIR", str(tmp_path))
@@ -427,7 +442,7 @@ def test_stage_system_view_explains_a_denied_live_request() -> None:
 
 def test_naive_restart_returns_to_a_blank_conversation() -> None:
     frame = _demo_frame(
-        {"_restarted": True, "_replacement_worker": True},
+        {"_restarted": True, "_new_process": True},
         [],
         stage_mode=True,
     )
@@ -448,8 +463,8 @@ def test_naive_restart_returns_to_a_blank_conversation() -> None:
     assert "Refund: none" in text
 
 
-def test_naive_worker_gone_is_a_visible_stage_beat() -> None:
-    frame = _demo_frame({"_worker_gone": True}, [], stage_mode=True)
+def test_naive_process_gone_is_a_visible_stage_beat() -> None:
+    frame = _demo_frame({"_process_gone": True}, [], stage_mode=True)
     output = io.StringIO()
     Console(file=output, width=128).print(frame)
     text = output.getvalue()
@@ -489,7 +504,8 @@ def test_naive_agent_loop_reaches_the_refund_before_stripe_is_called() -> None:
     assert "Please refund my python plushy" in text
     assert "AGENT LOOP" in text
     assert "✓ Damage: Split seam" in text
-    assert "✓ Order: python plushy (memory)" in text
+    assert "✓ Order: python plushy" in text
+    assert "python plushy (memory)" not in text
     assert "→ Next: issue refund" in text
     assert "WORK NOT SAVED" in text
     assert "Next step: submit the refund." in text
@@ -506,7 +522,7 @@ def test_naive_status_check_cannot_recover_working_memory_from_stripe() -> None:
             "memory": {"tenure_days": 824, "prior_refunds": 1},
             "_status_checked": True,
             "_refund_missing": True,
-            "_replacement_worker": True,
+            "_new_process": True,
         },
         [],
         stage_mode=True,
@@ -623,14 +639,14 @@ _NAIVE_STAGE_AGENTS = {
         "user_message": "Please refund order 1234.",
         "_loop_steps": _CACHED_STEPS,
     },
-    "gone": {"_worker_gone": True},
-    "new process": {"_restarted": True, "_replacement_worker": True},
+    "gone": {"_process_gone": True},
+    "new process": {"_restarted": True, "_new_process": True},
     "starts over": {
         "context": {"order": "1234", "amount": 8000, "customer": "Nyghtowl"},
         "user_message": "What happened to my refund?",
         "_status_checked": True,
         "_refund_missing": True,
-        "_replacement_worker": True,
+        "_new_process": True,
     },
 }
 
@@ -665,8 +681,8 @@ def test_naive_stage_frame_has_no_footer_cue() -> None:
     [
         (
             tui.DemoSetup(),
-            "Scripted steps · offline ledger (no Stripe)",
-            "Fixed policy (no LLM) · sample lookups · offline ledger (no Stripe)",
+            "OFFLINE: fixed policy, no model calls · offline ledger (no Stripe)",
+            "OFFLINE: fixed policy, no model calls · offline ledger (no Stripe)",
             "OFFLINE LEDGER (Stripe stand-in)",
         ),
         (
@@ -724,3 +740,190 @@ def test_stage_headers_disclose_what_is_scripted(
         assert "STRIPE" not in naive.getvalue() + durable.getvalue()
     for output in (naive, durable):
         assert all(len(line) <= 80 for line in output.getvalue().splitlines())
+
+
+def test_offline_header_is_bold_not_dim() -> None:
+    header = tui._demo_header("Demo", "subtitle", tui.DemoSetup().durable_line)
+    live = tui._demo_header(
+        "Demo", "subtitle", tui.DemoSetup(model_provider="openai").durable_line
+    )
+
+    [offline_span] = [span for span in header.spans if "yellow" in str(span.style)]
+    assert header.plain[offline_span.start : offline_span.end].startswith(
+        "OFFLINE: fixed policy, no model calls"
+    )
+    assert not [span for span in live.spans if "yellow" in str(span.style)]
+
+
+def test_agent_view_comes_from_the_progress_query_without_noise_rows() -> None:
+    progress = {
+        "phase": "issuing_refund",
+        "request": {"request_id": "r", "order_id": "order-1234", "amount_cents": 8000},
+        "working_memory": [
+            {"tool": "agent_step", "action": "ask_customer", "question_id": "damage"},
+            {"tool": "customer_answer", "result": {"question_id": "damage"}},
+            {"tool": "agent_step", "action": "use_tool", "tool_chosen": "lookup_order"},
+            {"tool": "lookup_order", "result": {"item": "python plushy"}},
+        ],
+        "decision": {"recommendation": "approve", "source": "canned"},
+    }
+
+    view = tui.view_from_progress(progress)
+
+    assert view["context"]["order_id"] == "order-1234"
+    assert [obs["tool"] for obs in view["observations"]] == ["lookup_order"]
+    assert view["decision"]["recommendation"] == "approve"
+    assert tui.view_from_progress(None) == {}
+
+
+def test_denied_agent_panel_explains_why_from_the_query_view(monkeypatch) -> None:
+    monkeypatch.setattr(tui, "_worker_alive", lambda: (True, 456))
+    view = {
+        "context": {"order_id": "order-1234", "amount_cents": 8000, "reason": "x"},
+        "observations": [{"tool": "lookup_order"}],
+        "decision": {"recommendation": "deny", "rationale": "Not eligible."},
+    }
+
+    text = tui._stage_agent_panel("denied", view=view).renderable.plain
+
+    assert "Order details" in text
+    assert "Do not issue the refund" in text
+    assert "Not eligible." in text
+
+
+@pytest.mark.parametrize(("attempt", "shown"), [(None, False), (1, False), (2, True)])
+def test_only_a_retry_attempt_is_shown(attempt, shown) -> None:
+    panel = tui._stage_system_view(
+        status="RUNNING",
+        refund=None,
+        pending_attempt=attempt,
+        refund_step_completed=False,
+        loop_steps=_CACHED_STEPS,
+    )
+
+    assert ("Current attempt" in panel.renderable.plain) is shown
+
+
+@pytest.mark.parametrize(
+    ("refund_id", "heading"),
+    [
+        (None, "STRIPE (source of truth)"),
+        ("re_dry_abc", "OFFLINE LEDGER (Stripe stand-in, source of truth)"),
+    ],
+)
+def test_watch_view_names_the_refund_owner_as_the_source_of_truth(
+    tmp_path, monkeypatch, refund_id, heading
+) -> None:
+    monkeypatch.setenv("DEMO_STATE_DIR", str(tmp_path))
+    if refund_id is not None:
+        monkeypatch.setattr(
+            tui,
+            "find_refund",
+            lambda _workflow_id: {"refund_id": refund_id, "status": "succeeded"},
+        )
+
+    async def fetch_history():
+        return _recorded_loop()
+
+    panel = asyncio.run(tui._system_panel(_fake_client(fetch_history), "watch"))
+    text = panel.renderable.plain
+
+    assert "EXECUTION STATE" in text
+    assert heading in text
+    assert "EFFECT STATE" not in text
+
+
+def test_only_past_cases_row_is_labeled_memory() -> None:
+    body = Text()
+    tui._append_loop_steps(body, _CACHED_STEPS)
+
+    assert "  ✓ Past cases (memory): none yet\n" in body.plain
+    # Record lookups are not memory, so they carry no memory tag.
+    assert "  ✓ Refund history: clean\n" in body.plain
+    assert body.plain.count("(memory)") == 1
+
+
+def test_case_note_lines_fit_a_narrow_pane() -> None:
+    from refund_agent.activities.tools import case_note_lines
+
+    note = (
+        "2026-11-23: refund succeeded for order-1234, $80.00. "
+        "Clean history and a damaged item."
+    )
+    assert case_note_lines(note) == [
+        "2026-11-23  refund succeeded",
+        "order 1234 · $80.00",
+    ]
+    # An unexpected format still shows, wrapped and capped.
+    assert all(len(line) <= 34 for line in case_note_lines("x " * 80))
+
+
+def test_final_frame_shows_the_case_note_the_new_worker_saved() -> None:
+    panel = tui._stage_system_view(
+        status="COMPLETED",
+        refund={"calls": 1, "status": "succeeded"},
+        pending_attempt=None,
+        refund_step_completed=True,
+        case_note="2026-11-23: refund succeeded for order-1234, $80.00. Clean.",
+    )
+    text = panel.renderable.plain
+
+    assert "LONG-TERM MEMORY" in text
+    assert "Case note saved after the refund:" in text
+    assert "order 1234 · $80.00" in text
+    # Each line fits the right pane at the smallest stage width.
+    for width in (80, 100):
+        output = io.StringIO()
+        Console(file=output, width=width // 2).print(panel)
+        rendered = output.getvalue()
+        assert "order 1234 · $80.00" in rendered
+        assert "Case note saved after the refund:" in rendered
+
+
+def test_final_frame_has_no_memory_section_without_a_note() -> None:
+    panel = tui._stage_system_view(
+        status="COMPLETED",
+        refund={"calls": 1, "status": "succeeded"},
+        pending_attempt=None,
+        refund_step_completed=True,
+    )
+
+    assert "LONG-TERM MEMORY" not in panel.renderable.plain
+
+
+def test_recovered_agent_reports_back_without_being_asked(monkeypatch) -> None:
+    monkeypatch.setattr(tui, "_worker_alive", lambda: (True, 1))
+
+    panel = tui._stage_agent_panel("done", recovered=True, refund_status="succeeded")
+
+    assert "(the customer didn't ask)" in panel.renderable.plain
+    assert "Your refund is complete." in panel.renderable.plain
+
+
+def test_naive_follow_up_finds_no_memory_because_nothing_was_saved() -> None:
+    frame = _demo_frame(
+        {
+            "context": {"order": "1234", "amount": 8000},
+            "_status_checked": True,
+            "_refund_missing": True,
+            "_past_cases": 0,
+            "user_message": "What happened to my refund?",
+        },
+        [],
+        stage_mode=True,
+    )
+    output = io.StringIO()
+    Console(file=output, width=100).print(frame)
+    text = output.getvalue()
+
+    assert "✓ Past cases (memory): none" in text
+    assert "nothing saved; the process died first" in text
+
+
+def test_get_case_note_reads_one_case(tmp_path, monkeypatch) -> None:
+    from refund_agent import store
+
+    monkeypatch.setenv("DEMO_STATE_DIR", str(tmp_path))
+    assert store.get_case_note("wf-1") is None
+    store.add_case_note("cus_demo_42", "wf-1", "a note")
+    assert store.get_case_note("wf-1") == "a note"

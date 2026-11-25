@@ -16,10 +16,12 @@ from typing import Any
 
 import stripe
 from temporalio.client import Client, WorkflowFailureError
+from temporalio.common import WorkflowIDConflictPolicy, WorkflowIDReusePolicy
+from temporalio.exceptions import WorkflowAlreadyStartedError
 from temporalio.service import RPCError, RPCStatusCode
 
 from refund_agent.fake_stripe import find_refund
-from refund_agent.models import RefundRequest, RefundResult
+from refund_agent.models import OFFLINE_POLICY, RefundRequest, RefundResult
 from refund_agent.settings import (
     MODEL_USAGE_FILE,
     load_env_file,
@@ -50,15 +52,48 @@ async def _client() -> Client:
     )
 
 
+def _missing_live_keys(provider: str | None) -> list[str]:
+    """The keys a live run (a model and Stripe test mode) still needs."""
+
+    provider = (provider or os.getenv("AGENT_MODEL_PROVIDER") or "").strip().lower()
+    if not provider:
+        with_keys = [name for name, key in _MODEL_KEYS.items() if os.getenv(key)]
+        provider = with_keys[0] if with_keys else "openai"
+    needed = [
+        _MODEL_KEYS.get(provider, "OPENAI_API_KEY"),
+        _MODEL_NAMES.get(provider, "OPENAI_MODEL"),
+        "STRIPE_API_KEY",
+    ]
+    return [name for name in needed if not os.getenv(name)]
+
+
 async def _start(args: argparse.Namespace) -> None:
+    # Live by default: a model and Stripe test mode. Offline only on purpose.
+    offline = args.offline
+    if args.seed and offline:
+        print("THE SYSTEM | --seed creates a Stripe test charge; drop --offline")
+        return
+    if not offline:
+        missing = _missing_live_keys(args.model_provider)
+        if missing:
+            print(
+                f"THE SYSTEM | a live run needs {', '.join(missing)}. Set them in "
+                ".env, or pass --offline for the fixed policy and the offline "
+                "ledger (no model calls, no Stripe)."
+            )
+            return
     client = await _client()
-    workflow_id = args.workflow_id or f"refund-{uuid.uuid4()}"
-    dry_run = args.dry_run
+    # BUSINESS IDENTITY: the Workflow ID comes from the refund request, so one
+    # request maps to one Workflow ID. Temporal then refuses a second run for a
+    # request that is still running or already succeeded (the policies on
+    # start_workflow below), and the refund's idempotency key, derived from the
+    # Workflow ID, is the same for every run of that request.
+    request_id = args.request_id or args.workflow_id or f"req-{uuid.uuid4().hex[:12]}"
+    workflow_id = args.workflow_id or f"refund-{request_id}"
     payment_intent = args.payment_intent
     if args.seed:
-        # Seeding a real charge implies a real refund against it, so there is no
-        # PaymentIntent id to copy and the payment and refund net to zero.
-        dry_run = False
+        # Seeding a real charge to refund against, so there is no PaymentIntent
+        # id to copy and the payment and refund net to zero.
         try:
             intent = _create_test_payment(args.amount_cents)
         except RuntimeError as error:
@@ -74,23 +109,41 @@ async def _start(args: argparse.Namespace) -> None:
         )
         print("SETUP | this charge nets to zero once the refund posts")
     request = RefundRequest(
-        request_id=args.request_id or workflow_id,
+        request_id=request_id,
         order_id=args.order_id,
         customer_id=args.customer_id,
         payment_intent_id=payment_intent,
         amount_cents=args.amount_cents,
         reason=args.reason,
-        dry_run=dry_run,
-        # Demo-only: --hold keeps the run open after the refund until `release`.
-        hold_after_effect=args.hold,
-        model_provider=args.model_provider,
+        dry_run=offline,
+        model_provider=OFFLINE_POLICY if offline else args.model_provider,
     )
-    await client.start_workflow(
-        RefundWorkflow.run,
-        request,
-        id=workflow_id,
-        task_queue=task_queue(),
-    )
+    try:
+        await client.start_workflow(
+            RefundWorkflow.run,
+            request,
+            id=workflow_id,
+            task_queue=task_queue(),
+            # A run for this request is already open: fail instead of starting
+            # a second one beside it.
+            id_conflict_policy=WorkflowIDConflictPolicy.FAIL,
+            # A closed run blocks a new one unless it failed, was cancelled,
+            # or was terminated, so a request that already got its refund
+            # can't be refunded again under the same ID.
+            id_reuse_policy=WorkflowIDReusePolicy.ALLOW_DUPLICATE_FAILED_ONLY,
+        )
+    except WorkflowAlreadyStartedError:
+        print(
+            f"THE SYSTEM | request {request_id} already has a Workflow "
+            f"({workflow_id}) that is running or completed. Check it with: "
+            f"refund-demo inspect {workflow_id}"
+        )
+        if args.seed:
+            print(
+                "THE SYSTEM | the charge seeded above was not used; "
+                "run refund-demo cleanup"
+            )
+        return
     print(f"EXECUTION STATE | started Workflow {workflow_id}")
     print(
         f"CONTEXT | refund {request.request_id}: order {request.order_id}, "
@@ -116,33 +169,39 @@ async def _approve(args: argparse.Namespace) -> None:
     print(f"EXECUTION STATE | approval Signal recorded for {args.workflow_id}")
 
 
-async def _release(args: argparse.Namespace) -> None:
-    # Sends the demo-only `release` Signal that ends a held run's wait.
-    client = await _client()
-    handle = client.get_workflow_handle_for(RefundWorkflow.run, args.workflow_id)
-    try:
-        await handle.signal(RefundWorkflow.release)
-    except RPCError as error:
-        if _not_found(error):
-            print(f"THE SYSTEM | no Workflow named {args.workflow_id}")
-            return
-        raise
-    print(f"EXECUTION STATE | release Signal recorded for {args.workflow_id}")
-
-
 async def _stop(args: argparse.Namespace) -> None:
     client = await _client()
     handle = client.get_workflow_handle(args.workflow_id)
     try:
-        await handle.terminate(reason=args.reason)
+        if args.terminate:
+            # Terminate closes the run at once and runs no Workflow code. Use it
+            # only when no Worker will pick the run up to handle a cancel.
+            await handle.terminate(reason=args.reason)
+        else:
+            # Cancel asks the Workflow to stop and lets its code decide how:
+            # before the refund it closes as Cancelled; during the refund it
+            # finishes the Stripe call first and records the outcome.
+            await handle.cancel()
     except RPCError as error:
         if _not_found(error):
             print(f"THE SYSTEM | no running Workflow named {args.workflow_id}")
         else:
-            print(f"THE SYSTEM | could not terminate {args.workflow_id}: {error}")
+            print(f"THE SYSTEM | could not stop {args.workflow_id}: {error}")
         return
-    print(f"EXECUTION STATE | terminated Workflow {args.workflow_id}")
-    print("THE SYSTEM | if it seeded a charge, run refund-demo cleanup to reconcile")
+    if args.terminate:
+        print(f"EXECUTION STATE | terminated Workflow {args.workflow_id}")
+    else:
+        print(
+            f"EXECUTION STATE | cancel requested for {args.workflow_id}; a running "
+            "Worker handles it. Check it with: "
+            f"refund-demo inspect {args.workflow_id}"
+        )
+    # Seeded test charges are demo setup, not part of the refund request, so
+    # the Workflow never refunds them on cancel. Cleanup resets the account.
+    print(
+        "THE SYSTEM | leftover seeded test charges stay paid; "
+        "refund-demo cleanup refunds them"
+    )
 
 
 async def _result(args: argparse.Namespace) -> None:
@@ -219,15 +278,20 @@ def _phase(rows: list[dict[str, object]], status: str) -> str:
     signals = [row.get("name") for row in rows if row.get("event") == "signal"]
     completed = [row.get("name") for row in rows if row.get("event") == "completed"]
     if "issue_refund" in completed:
-        # Still running after the refund step, as in the --hold durable wait.
+        # Still running after the refund step: the case note is not saved yet.
         return "refund recorded"
     if "issue_refund" in scheduled:
-        return "refund effect in flight"
+        return "refund in flight"
     if "approve" in signals:
         return "approved, issuing refund"
     tools = [
         name
-        for name in ("lookup_order", "lookup_customer_history", "check_refund_policy")
+        for name in (
+            "lookup_order",
+            "lookup_customer_history",
+            "check_refund_policy",
+            "search_memory",
+        )
         if name in completed
     ]
     if tools:
@@ -240,9 +304,9 @@ def _phase(rows: list[dict[str, object]], status: str) -> str:
 def _print_dry_run_stripe_view(workflow_id: str) -> bool:
     refund = find_refund(workflow_id)
     if refund is None:
-        print("THE SYSTEM | dry-run Stripe ledger has no committed refund")
+        print("THE SYSTEM | offline ledger (Stripe stand-in) has no committed refund")
         return False
-    print(f"THE SYSTEM | dry-run Stripe ledger\n{_json(refund)}")
+    print(f"THE SYSTEM | offline ledger (Stripe stand-in)\n{_json(refund)}")
     print("THE SYSTEM | unique Stripe refunds for this key: 1")
     return True
 
@@ -302,8 +366,8 @@ async def _inspect(args: argparse.Namespace) -> None:
     ]
 
     print(
-        "CONTEXT + MEMORY | not available here; that view existed only in the "
-        "Worker process"
+        "CONTEXT + WORKING MEMORY | not shown here; a Worker rebuilds it from "
+        "Event History by replay"
     )
     print(
         "THE SYSTEM | Temporal\n"
@@ -367,10 +431,10 @@ async def _seed_payment(args: argparse.Namespace) -> None:
         f"status {intent.status} amount {intent.amount}"
     )
     print(
-        "Refund this one: refund-demo start --real "
+        "Refund this one: refund-demo start "
         f"--payment-intent {intent.id} --amount-cents {args.amount_cents}"
     )
-    print("Or seed and refund in one step: refund-demo start --real --seed")
+    print("Or seed and refund in one step: refund-demo start --seed")
 
 
 async def _cleanup(args: argparse.Namespace) -> None:
@@ -442,8 +506,9 @@ def choose_stage_mode(
     The default is the live run: a live model and Stripe test mode. Keys come
     from .env or the shell. When one is missing and a person is at the
     terminal, ask for it for this run only (it is not saved); pressing Enter
-    runs the offline demo instead. Without a terminal, as in tests and CI, the
-    run goes offline. --offline, --real, and --real-model skip the choice.
+    runs the offline demo instead. Offline happens only on purpose: without a
+    terminal to ask, as in tests and CI, missing keys are an error that says to
+    pass --offline. --offline, --real, and --real-model skip the choice.
     """
 
     if args.offline:
@@ -468,8 +533,11 @@ def choose_stage_mode(
     missing = [item for item in needed if not os.getenv(item[0])]
     if missing and not interactive:
         names = ", ".join(name for name, _, _ in missing)
-        print(f"STAGE | Offline run: {names} not set, and no terminal to ask.")
-        return False, False, None
+        raise RuntimeError(
+            f"the live run needs {names}, and there is no terminal to ask. Set "
+            "them in .env, or pass --offline for the fixed policy and the "
+            "offline ledger (no model calls, no Stripe)."
+        )
     if missing:
         print("The live run uses a model and Stripe test mode. Still needed:")
         for _, label, _ in missing:
@@ -482,11 +550,9 @@ def choose_stage_mode(
                 print("STAGE | Running the offline demo.")
                 return False, False, None
             if name == "STRIPE_API_KEY":
-                try:
-                    validate_stripe_key(value, required=True)
-                except RuntimeError as error:
-                    print(f"STAGE | {error}. Running the offline demo.")
-                    return False, False, None
+                # A bad key is an error, not a quiet switch to offline. Enter
+                # alone is the way to choose the offline demo.
+                validate_stripe_key(value, required=True)
             os.environ[name] = value
     print(
         f"STAGE | Live run: {_PROVIDER_LABELS[provider]} model and Stripe test "
@@ -517,6 +583,8 @@ async def _stage(args: argparse.Namespace) -> None:
         )
     except RuntimeError as error:
         print(f"STAGE | {error}")
+        # A nonzero exit, so a script or make target sees the stage did not run.
+        raise SystemExit(1) from None
 
 
 # COST: USD per 1M tokens. Reasoning is billed as output and is already inside
@@ -726,20 +794,19 @@ def _parser() -> argparse.ArgumentParser:
         "--reason",
         default="The python plushy arrived with a split seam",
     )
-    mode = start.add_mutually_exclusive_group()
-    mode.add_argument("--dry-run", action="store_true", dest="dry_run")
-    mode.add_argument("--real", action="store_false", dest="dry_run")
-    start.set_defaults(dry_run=True)
+    # Live by default: a configured model and Stripe test mode.
+    start.add_argument(
+        "--offline",
+        "--dry-run",
+        action="store_true",
+        dest="offline",
+        help="run offline on purpose: the fixed policy and the offline ledger, "
+        "no model calls and no Stripe",
+    )
     start.add_argument(
         "--seed",
         action="store_true",
-        help="seed a Stripe test PaymentIntent and refund it (implies --real)",
-    )
-    start.add_argument(
-        "--hold",
-        action="store_true",
-        help="after the refund, hold the run open so a restart shows replay "
-        "skipping the recorded step (finish with: refund-demo release ID)",
+        help="seed a Stripe test PaymentIntent and refund it",
     )
     start.add_argument(
         "--model-provider",
@@ -751,13 +818,16 @@ def _parser() -> argparse.ArgumentParser:
     approve.add_argument("workflow_id")
     approve.add_argument("note", nargs="?", default="")
 
-    release = commands.add_parser(
-        "release", help="release a run held open after its refund (start --hold)"
+    stop = commands.add_parser(
+        "stop", help="cancel a running Workflow (or --terminate one no Worker runs)"
     )
-    release.add_argument("workflow_id")
-
-    stop = commands.add_parser("stop", help="terminate a running Workflow")
     stop.add_argument("workflow_id")
+    stop.add_argument(
+        "--terminate",
+        action="store_true",
+        help="close the run at once without running Workflow code; for runs "
+        "no Worker will pick up",
+    )
     stop.add_argument("--reason", default="stopped from refund-demo")
 
     result = commands.add_parser("result", help="wait for and print the result")
@@ -802,12 +872,12 @@ def _parser() -> argparse.ArgumentParser:
     stage.add_argument(
         "--simulate-stripe-retry",
         action="store_true",
-        help="interrupt after Stripe accepts attempt 1, then retry after replacement",
+        help="interrupt after Stripe accepts attempt 2, then retry on a new Worker",
     )
     stage.add_argument(
         "--simulate-stripe-timeout",
         action="store_true",
-        help="hang attempt 1 before Stripe responds, then retry after replacement",
+        help="hang attempt 1 before Stripe responds, then retry on a new Worker",
     )
 
     seed = commands.add_parser(
@@ -844,8 +914,6 @@ async def _async_main(args: argparse.Namespace) -> None:
         await _start(args)
     elif args.command == "approve":
         await _approve(args)
-    elif args.command == "release":
-        await _release(args)
     elif args.command == "stop":
         await _stop(args)
     elif args.command == "result":

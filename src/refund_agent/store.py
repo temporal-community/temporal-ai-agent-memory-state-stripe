@@ -1,9 +1,14 @@
 """A small SQLite database that stands in for the business systems and memory.
 
-The lookup tools read orders, customer history, and the refund policy from it,
-and the remember_case Activity writes a short note after each refund. Later
-runs read those notes back with the customer's history: a light version of
-long-term memory, kept in a store you own rather than in Temporal.
+It holds two kinds of tables, kept apart on purpose:
+
+- Records (orders, customers, purchases, prior_refunds): the business systems
+  of record. The lookup tools read them; the agent never writes them.
+- Memory (case_notes): the agent's long-term memory. remember_case writes a
+  short note after each refund, and search_memory reads a customer's notes
+  back. Memory says what the agent noted, not what happened, so it never
+  comes back through a record lookup. It is a light version of long-term
+  memory, kept in a store you own rather than in Temporal.
 
 The file lives in the state directory (.demo-state/store.sqlite by default).
 Each guided stage run has its own state directory, so every stage run starts
@@ -48,6 +53,7 @@ CREATE TABLE IF NOT EXISTS prior_refunds (
     customer_id TEXT NOT NULL,
     line TEXT NOT NULL
 );
+-- Long-term memory, separate from the records above.
 CREATE TABLE IF NOT EXISTS case_notes (
     customer_id TEXT NOT NULL,
     case_id TEXT NOT NULL UNIQUE,
@@ -141,16 +147,37 @@ def get_customer(customer_id: str) -> dict | None:
             "SELECT line FROM prior_refunds WHERE customer_id = ? ORDER BY rowid",
             (customer_id,),
         ).fetchall()
-        notes = connection.execute(
-            "SELECT note FROM case_notes WHERE customer_id = ? ORDER BY rowid DESC",
-            (customer_id,),
-        ).fetchall()
     return {
         "account_tenure_days": row[0],
         "purchases": [line for (line,) in purchases],
         "prior_refunds": [line for (line,) in refunds],
-        "past_cases": [note for (note,) in notes],
     }
+
+
+# ---------------------------------------------------------------------------
+# Long-term memory: case notes, read and written apart from the records.
+# ---------------------------------------------------------------------------
+
+
+def get_case_note(case_id: str) -> str | None:
+    """The note saved for one case (a Workflow ID), or None if none was saved."""
+
+    with connect() as connection:
+        row = connection.execute(
+            "SELECT note FROM case_notes WHERE case_id = ?", (case_id,)
+        ).fetchone()
+    return None if row is None else str(row[0])
+
+
+def get_case_notes(customer_id: str) -> list[str]:
+    """This customer's case notes, newest first."""
+
+    with connect() as connection:
+        notes = connection.execute(
+            "SELECT note FROM case_notes WHERE customer_id = ? ORDER BY rowid DESC",
+            (customer_id,),
+        ).fetchall()
+    return [note for (note,) in notes]
 
 
 def add_case_note(customer_id: str, case_id: str, note: str) -> bool:

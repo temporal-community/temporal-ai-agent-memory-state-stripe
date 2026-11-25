@@ -20,10 +20,10 @@ def idempotency_key_for(workflow_id: str) -> str:
 
 
 def ledger_path() -> Path:
-    # A local record of the effect, so the stage viewer can show one refund and
+    # A local record of the refund, so the stage viewer can show one refund and
     # its call count in either mode. In dry-run it stands in for Stripe; in real
     # mode it mirrors what Stripe already owns, purely for the panel.
-    return state_dir() / "effect-ledger.json"
+    return state_dir() / "refund-ledger.json"
 
 
 def _read_ledger(path: Path) -> dict[str, Any]:
@@ -82,7 +82,7 @@ def create_refund(
         return dict(refund)
 
 
-def record_effect(
+def record_refund(
     *,
     workflow_id: str,
     refund_id: str,
@@ -131,15 +131,50 @@ def record_effect(
 
 
 def find_refund(workflow_id: str) -> dict[str, Any] | None:
-    # Match by the stored workflow_id field rather than re-deriving the key. The
-    # idempotency key is derived from the workflow RUN identity, which callers do
-    # not hold, so scan the ledger and return the latest run's refund for this
-    # Workflow.
+    # Match by the stored workflow_id field. Demo 2's key comes from the Workflow
+    # ID, so this finds the one refund for that Workflow ID; Demo 1 stores its
+    # request id in the same field.
     path = ledger_path()
     with _LOCK:
         ledger = _read_ledger(path)
     match = None
     for refund in ledger.get("refunds", {}).values():
         if refund.get("workflow_id") == workflow_id:
-            match = refund  # keep the last (most recent) matching run
+            match = refund
     return dict(match) if match is not None else None
+
+
+def refunds_for_payment_intent(payment_intent_id: str) -> list[dict[str, Any]]:
+    """Every refund the ledger holds for one payment, like Stripe's Refund.list."""
+
+    path = ledger_path()
+    with _LOCK:
+        ledger = _read_ledger(path)
+    return [
+        dict(refund)
+        for refund in ledger.get("refunds", {}).values()
+        if refund.get("payment_intent_id") == payment_intent_id
+    ]
+
+
+def forget_refunds(workflow_id_prefix: str) -> int:
+    """Drop the refunds whose workflow_id starts with a prefix; return how many.
+
+    Only `naive-refund reset` calls this, to clear Demo 1's offline refunds
+    without touching Demo 2's.
+    """
+
+    path = ledger_path()
+    with _LOCK:
+        ledger = _read_ledger(path)
+        refunds = ledger.get("refunds", {})
+        kept = {
+            key: refund
+            for key, refund in refunds.items()
+            if not str(refund.get("workflow_id", "")).startswith(workflow_id_prefix)
+        }
+        removed = len(refunds) - len(kept)
+        if removed:
+            ledger["refunds"] = kept
+            _write_ledger(path, ledger)
+    return removed

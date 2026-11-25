@@ -1,8 +1,10 @@
-"""The model turn: the agent_decide_next_step Activity and the decision behind it.
+"""The model turn: the agent_decide_next_step Activity and the steps behind it.
 
-decide_next_step picks one turn's next step for both demos: the demo's intake
-questions, the fixed policy, or a live OpenAI or Anthropic model with tool
-calling. Usage logging for `refund-demo usage` lives here too.
+model_next_step asks a live OpenAI or Anthropic model for one turn's next step,
+with tool calling. fixed_policy_step is the offline stand-in: a deterministic
+policy that makes no model calls. Each caller (the Activity for Demo 2, the
+agent process for Demo 1) picks one explicitly from the request's
+model_provider. Usage logging for `refund-demo usage` lives here too.
 """
 
 from __future__ import annotations
@@ -23,14 +25,13 @@ from openai.types.responses import FunctionToolParam
 from temporalio import activity
 from temporalio.exceptions import ApplicationError
 
-from refund_agent.activities.tools import TOOL_HISTORY, TOOL_ORDER, TOOL_POLICY
-from refund_agent.activities.view import (
-    _agent_summary,
-    _line,
-    _mirror_agent_view,
-    _view_for,
+from refund_agent.activities.tools import (
+    TOOL_HISTORY,
+    TOOL_MEMORY,
+    TOOL_ORDER,
+    TOOL_POLICY,
 )
-from refund_agent.models import AgentStep, RefundRequest
+from refund_agent.models import OFFLINE_POLICY, AgentStep, RefundRequest
 from refund_agent.settings import model_usage_path
 
 # Refunds at or below this clear on their own; larger ones escalate to a human.
@@ -38,7 +39,7 @@ APPROVE_THRESHOLD_CENTS = 10000
 
 
 # ---------------------------------------------------------------------------
-# The model turn. Dry-run uses a deterministic policy; real uses tool-calling.
+# The fixed offline policy: deterministic, no model calls.
 # ---------------------------------------------------------------------------
 
 
@@ -60,15 +61,21 @@ def _customer_answer(working_memory: list[dict], question_id: str) -> str | None
     return None
 
 
-def _missing_question_step(working_memory: list[dict]) -> AgentStep | None:
-    if _customer_answer(working_memory, "item_opened") is None:
+def _missing_question_step(
+    request: RefundRequest, working_memory: list[dict]
+) -> AgentStep | None:
+    # Ask only for intake answers the request did not already carry.
+    if (
+        request.item_opened is None
+        and _customer_answer(working_memory, "item_opened") is None
+    ):
         return AgentStep(
             action="ask_customer",
             question_id="item_opened",
             question="Was the package opened?",
             suggested_answer="Yes",
         )
-    if _customer_answer(working_memory, "damage") is None:
+    if request.damage is None and _customer_answer(working_memory, "damage") is None:
         return AgentStep(
             action="ask_customer",
             question_id="damage",
@@ -78,20 +85,29 @@ def _missing_question_step(working_memory: list[dict]) -> AgentStep | None:
     return None
 
 
-def _canned_step(request: RefundRequest, working_memory: list[dict]) -> AgentStep:
-    # A deterministic policy for the offline demo. The path still varies with the
-    # request: a clean, low-value refund clears in two lookups; a larger one digs
-    # into the refund policy and escalates.
-    if request.interactive_questions:
-        question = _missing_question_step(working_memory)
-        if question is not None:
-            return question
+def fixed_policy_step(request: RefundRequest, working_memory: list[dict]) -> AgentStep:
+    """One turn of the fixed offline policy, the demo's stand-in for a model.
 
+    It asks for any missing intake answer (item_opened, then damage), then
+    looks up the order and the customer's history, searches past cases in
+    long-term memory, and decides. The path still varies with the request: a
+    clean, low-value refund clears there; a larger one digs into the refund
+    policy and escalates.
+    """
+
+    question = _missing_question_step(request, working_memory)
+    if question is not None:
+        return question
+
+    # Tool results are keyed by tool name; the agent's own turns ("agent_step")
+    # and customer answers never match a lookup.
     done = {obs.get("tool") for obs in working_memory}
     if TOOL_ORDER not in done:
         return AgentStep(action="use_tool", tool=TOOL_ORDER)
     if TOOL_HISTORY not in done:
         return AgentStep(action="use_tool", tool=TOOL_HISTORY)
+    if TOOL_MEMORY not in done:
+        return AgentStep(action="use_tool", tool=TOOL_MEMORY)
     history = _observation(working_memory, TOOL_HISTORY) or {}
     prior = len(history.get("prior_refunds") or [])
     clean = request.amount_cents <= APPROVE_THRESHOLD_CENTS and prior <= 1
@@ -114,6 +130,10 @@ def _canned_step(request: RefundRequest, working_memory: list[dict]) -> AgentSte
         ),
     )
 
+
+# ---------------------------------------------------------------------------
+# The live model: OpenAI or Anthropic with tool calling.
+# ---------------------------------------------------------------------------
 
 # The lookup tools take no arguments: the Workflow passes this run's order and
 # customer IDs, so the model chooses which tool to call but not whose records it
@@ -145,9 +165,16 @@ _TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "type": "function",
         "name": TOOL_HISTORY,
+        "description": "Look up the customer's tenure, purchases, and prior refunds.",
+        "parameters": {"type": "object", "properties": {}},
+    },
+    {
+        "type": "function",
+        "name": TOOL_MEMORY,
         "description": (
-            "Look up the customer's tenure, purchases, prior refunds, and notes "
-            "from past cases."
+            "Recall notes from this customer's past cases (your long-term "
+            "memory). Notes say what an earlier run concluded, not what the "
+            "records say."
         ),
         "parameters": {"type": "object", "properties": {}},
     },
@@ -179,16 +206,23 @@ _TOOL_SCHEMAS: list[dict[str, Any]] = [
 
 _AGENT_INSTRUCTIONS = (
     "You are a refund agent. Decide whether to approve, escalate, or deny a "
-    "refund. When interactive_questions is true, use ask_customer to collect "
-    "item_opened and damage one at a time unless customer_answer observations "
-    "already contain them. Use the other tools to gather what you need, then "
-    "call submit_decision. The lookup tools act on this request's order and "
-    "customer, so they take no arguments. "
+    "refund. If the request leaves item_opened or damage empty and no "
+    "customer_answer observation has it, use ask_customer to collect it, one "
+    "question at a time, when it would help your decision. Use the other tools "
+    "to gather what you need, then call submit_decision. Before deciding, use "
+    "search_memory to check past cases for this customer. Observations with "
+    "tool agent_step are your own earlier turns. The lookup tools act on this "
+    "request's order and customer, so they take no arguments. "
     "Treat tool results as authoritative. Approve clear, low-value refunds with "
     "a clean customer history. When the policy tool says eligible, approve; do "
     "not require a physical return when return_required is false. Escalate to a "
     "human when the amount is large or the history looks risky. Deny only when "
     "the request clearly conflicts with the order or policy says it is ineligible."
+)
+
+# Added to the Anthropic system prompt, since that call can't force a tool.
+_ANTHROPIC_ONE_TOOL = (
+    " Respond to every turn by calling exactly one tool, with no text reply."
 )
 
 _MODEL_PROVIDERS = {"anthropic", "openai"}
@@ -236,12 +270,31 @@ def _model_view(value: object) -> object:
     return value
 
 
-def _model_payload(request: RefundRequest, working_memory: list[dict]) -> str:
-    """The prompt body both providers get: the request and every observation."""
+# The request fields the model reasons about. Routing and replay-only fields,
+# such as dry_run and model_provider, stay out of the prompt.
+_MODEL_REQUEST_FIELDS = (
+    "request_id",
+    "order_id",
+    "customer_id",
+    "amount_cents",
+    "reason",
+    "item_opened",
+    "damage",
+    "refund_destination",
+)
 
+
+def _model_payload(request: RefundRequest, working_memory: list[dict]) -> str:
+    """The prompt body both providers get: the request and every observation.
+
+    The observations include the agent's own earlier turns (agent_step), its
+    customer answers, and its tool results, in order.
+    """
+
+    fields = asdict(request)
     return json.dumps(
         {
-            "request": _model_view(asdict(request)),
+            "request": _model_view({key: fields[key] for key in _MODEL_REQUEST_FIELDS}),
             "observations": _model_view(working_memory),
         },
         sort_keys=True,
@@ -311,11 +364,10 @@ def _record_usage(
             log.write(json.dumps(record, sort_keys=True) + "\n")
     except OSError as error:
         # The call is already billed; a failed log write must not retry it.
-        _line("MODEL USAGE", f"could not write {path}: {error}")
+        activity.logger.warning(f"MODEL USAGE | could not write {path}: {error}")
         return
-    _line(
-        "MODEL USAGE",
-        f"{provider}:{model} input {input_tokens}, output {output_tokens}",
+    activity.logger.info(
+        f"MODEL USAGE | {provider}:{model} input {input_tokens}, output {output_tokens}"
     )
 
 
@@ -330,7 +382,7 @@ def _openai_step(
     if not model:
         raise ApplicationError(
             "OPENAI_MODEL is required for a real agent run. Set it to a model "
-            "your account can access, or run with --dry-run.",
+            "your account can access, or choose the offline policy with --offline.",
             type="OpenAIModelMissing",
             non_retryable=True,
         )
@@ -396,12 +448,8 @@ def _openai_step(
             suggested_answer=str(args.get("suggested_answer", "")),
             source=source,
         )
-    return AgentStep(
-        action="use_tool",
-        tool=call.name,
-        tool_args={key: str(value) for key, value in args.items()},
-        source=source,
-    )
+    # The lookup tools take no arguments, so nothing else is read from args.
+    return AgentStep(action="use_tool", tool=call.name, source=source)
 
 
 def _anthropic_step(
@@ -420,11 +468,14 @@ def _anthropic_step(
         )
     # Read before the paid call, so an invalid LOG_MODEL_USAGE fails first.
     usage_path = model_usage_path()
+    # strict keeps every tool call's arguments valid against its schema, which
+    # strict mode requires to forbid extra properties.
     tools: list[ToolParam] = [
         {
             "name": tool["name"],
             "description": tool["description"],
-            "input_schema": tool["parameters"],
+            "input_schema": {**tool["parameters"], "additionalProperties": False},
+            "strict": True,
         }
         for tool in _TOOL_SCHEMAS
     ]
@@ -434,11 +485,19 @@ def _anthropic_step(
     try:
         response = client.messages.create(
             model=model,
-            max_tokens=512,
-            system=_AGENT_INSTRUCTIONS,
+            # Room for the model's thinking before its one tool call. Current
+            # Claude models think by default, and thinking counts toward this.
+            max_tokens=4096,
+            # Low effort: each turn is one small choice, so deeper thinking
+            # only adds tokens.
+            output_config={"effort": "low"},
+            system=_AGENT_INSTRUCTIONS + _ANTHROPIC_ONE_TOOL,
             messages=[{"role": "user", "content": payload}],
             tools=tools,
-            tool_choice={"type": "any", "disable_parallel_tool_use": True},
+            # Current Claude models reject a forced tool choice ("any" or
+            # "tool") with HTTP 400, so the choice is "auto" and the
+            # instruction above asks for exactly one tool call.
+            tool_choice={"type": "auto", "disable_parallel_tool_use": True},
         )
     except anthropic.APIStatusError as error:
         status = error.status_code
@@ -459,10 +518,18 @@ def _anthropic_step(
         None,
     )
     if call is None:
+        if getattr(response, "stop_reason", None) == "refusal":
+            raise ApplicationError(
+                "Anthropic declined this turn (stop_reason refusal)",
+                type="AnthropicRefusal",
+                non_retryable=True,
+            )
+        # With tool_choice "auto" the model can answer in text instead of a
+        # tool call. That is usually a one-off, so Temporal retries the turn
+        # (up to the model retry policy's attempts in workflow.py).
         raise ApplicationError(
             "Anthropic returned no tool call for this turn",
-            type="AnthropicOutputError",
-            non_retryable=True,
+            type="AnthropicNoToolCall",
         )
     args = dict(call.input)
     source = f"anthropic:{model}"
@@ -481,43 +548,23 @@ def _anthropic_step(
             suggested_answer=str(args.get("suggested_answer", "")),
             source=source,
         )
-    return AgentStep(
-        action="use_tool",
-        tool=call.name,
-        tool_args={key: str(value) for key, value in args.items()},
-        source=source,
-    )
+    # The lookup tools take no arguments, so nothing else is read from args.
+    return AgentStep(action="use_tool", tool=call.name, source=source)
 
 
-def decide_next_step(
+def model_next_step(
     request: RefundRequest,
     working_memory: list[dict],
     *,
     agent: str = USAGE_AGENT_TEMPORAL,
 ) -> AgentStep:
-    """Choose one turn's next step: the decision both demos' agents share.
+    """Ask the live model for one turn's next step. It never falls back offline.
 
     The agent_decide_next_step Activity calls this for Demo 2. Demo 1's naive
     agent process calls it directly, with no Temporal, so both demos run the
-    same intake questions, fixed policy, or live model. `agent` only tags the
-    usage log.
+    same model step. `agent` only tags the usage log.
     """
 
-    required_question = (
-        _missing_question_step(working_memory)
-        if request.interactive_questions
-        else None
-    )
-    if required_question is not None:
-        # Demo-only intake (interactive_questions): the same two questions, in a
-        # fixed order, whichever model provider runs. Once the answers exist,
-        # the selected model autonomously chooses lookups and the final action.
-        return required_question
-    if request.use_canned_agent:
-        # Demo-only: the fixed policy stands in for the model, so the stage plays
-        # the same way every run and makes no model calls. A real app calls its
-        # model here.
-        return _canned_step(request, working_memory)
     provider = _selected_model_provider(request)
     if provider == "openai":
         api_key = os.getenv("OPENAI_API_KEY")
@@ -537,12 +584,9 @@ def decide_next_step(
                 non_retryable=True,
             )
         return _anthropic_step(request, working_memory, api_key, agent=agent)
-    if request.dry_run:
-        # Offline runs with no model configured fall back to the fixed policy.
-        return _canned_step(request, working_memory)
     raise ApplicationError(
-        "A live model key is required for a real run. Configure "
-        "Anthropic or OpenAI, or use --dry-run for the offline policy.",
+        "A live model key is required. Configure Anthropic or OpenAI, or choose "
+        "the offline policy explicitly (--offline).",
         type="ModelKeyMissing",
         non_retryable=True,
     )
@@ -554,40 +598,15 @@ def agent_decide_next_step(
 ) -> AgentStep:
     """MODEL REASONING: one turn of the agent loop."""
 
-    workflow_id = activity.info().workflow_id
-    view = _view_for(workflow_id)
-    if not working_memory:
-        # Turn one: reset this run's in-process view and show the context.
-        view.clear()
-        view["context"] = asdict(request)
-        print("=" * 64, flush=True)
-        _line(
-            "CONTEXT",
-            f"refund request {request.request_id}: order {request.order_id}, "
-            f"${request.amount_cents / 100:.2f}, customer {request.customer_id}",
-        )
-
-    step = decide_next_step(request, working_memory)
-
-    view["observations"] = working_memory
-    turn = len(working_memory) + 1
-    if step.action == "decide":
-        view["decision"] = {
-            "recommendation": step.recommendation,
-            "rationale": step.rationale,
-            "source": step.source,
-        }
-        _line(
-            "MODEL REASONING",
-            f"turn {turn}: decide -> {step.recommendation} ({step.rationale})",
-        )
-    elif step.action == "ask_customer":
-        _line(
-            "MODEL REASONING",
-            f"turn {turn}: next action -> ask {step.question_id}",
-        )
+    if request.model_provider == OFFLINE_POLICY:
+        # Demo-only: the fixed policy stands in for the model, chosen explicitly
+        # in the Workflow input, so an offline run makes no model calls and
+        # plays the same way every time. A real app calls its model.
+        step = fixed_policy_step(request, working_memory)
     else:
-        _line("MODEL REASONING", f"turn {turn}: plan -> call {step.tool}")
-    _mirror_agent_view(workflow_id, view)
-    _line("THE AGENT", f"in process: {_agent_summary(view)}")
+        step = model_next_step(request, working_memory)
+    activity.logger.info(
+        f"MODEL REASONING | {step.action} "
+        f"{step.recommendation or step.question_id or step.tool or ''}".rstrip()
+    )
     return step
