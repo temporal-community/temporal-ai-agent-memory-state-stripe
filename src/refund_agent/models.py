@@ -27,6 +27,9 @@ class RefundRequest:
     # "anthropic" or "openai" for a live model, OFFLINE_POLICY for the fixed
     # offline policy (no model calls), or None to pick from the configured keys.
     model_provider: str | None = None
+    # How long an escalated refund waits for a person's approval before the
+    # request expires with no refund (the Workflow's APPROVAL DEADLINE).
+    approval_timeout_seconds: int = 24 * 60 * 60
 
 
 # The model_provider value that selects the fixed offline policy instead of a

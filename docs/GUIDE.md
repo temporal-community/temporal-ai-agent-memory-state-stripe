@@ -909,6 +909,9 @@ uv run refund-demo approve demo-refund "verified defect, approving"
 uv run refund-demo result demo-refund
 ```
 
+An escalation waits 24 hours for that approval. If none arrives, the request
+expires: no refund is issued, and `refund-demo result` shows status `expired`.
+
 Low-value requests tend to approve automatically. To push the deterministic
 policy toward escalation, use a larger amount, such as `--amount-cents 15000`.
 

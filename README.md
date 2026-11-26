@@ -418,6 +418,12 @@ What Temporal doesn't do is carry knowledge from one run to the next:
   tell what it noted before from what the records say.
 - Temporal runs the store's reads and writes as Activities, so each one is
   recorded and retried like any other step.
+- This demo's case note is built from what the run already recorded, so
+  saving it needs no model call and one Activity is enough. When a model
+  writes the memory (a summary, or merged notes from several conversations),
+  split it into two Activities: one prepares the update and saves it, and one
+  publishes it. A failed write then retries the publish without paying for the
+  model call again.
 - Memory products such as mem0 and Amazon Bedrock AgentCore Memory decide what
   to keep, when to write it, and what to bring back into context. They plug in
   the same way, through Activities. For a full long-term memory demo on
@@ -553,6 +559,20 @@ The customer's answers aren't Activities. They arrive as Signals, and the
 Workflow waits for each one. Because Event History records each Activity's
 input and result, a new Worker can replay the loop without calling the model
 or the lookups again.
+
+**Why each step is its own Activity.** Where you draw Activity boundaries sets
+how much work a retry repeats, sometimes called granularity. You could wrap a
+whole agent run, or one turn, in a single Activity and keep your agent SDK's
+own loop; that's less integration work, but a crash mid-run repeats every
+model and tool call inside it. This demo uses the fine-grained end: each model
+turn and each lookup is its own Activity, so a new Worker reuses every result
+already recorded and calls the model only for turns that hadn't finished.
+
+An escalated refund waits for a person's approval, an `approve` Signal, but
+not forever. After `approval_timeout_seconds` (24 hours by default) the
+request expires: no refund is issued, and the Workflow completes with status
+`expired`. The deadline is a durable timer, so it holds across Worker
+restarts.
 
 <details>
 <summary>Detailed wiring: diagram, loop, retries, idempotency key, and timeouts</summary>
@@ -940,7 +960,11 @@ so the history grows with the square of the turn count. The server's defaults
 allow 2 MB per payload and 50 MB per run. This demo stops at
 `MAX_TURNS = 10`, and an offline run records about 8 KB of Activity payloads.
 Longer runs need a claim check or Continue-As-New. This lightweight demo only
-references them, and other demos will cover them in more detail.
+references them, and other demos will cover them in more detail. For
+Continue-As-New in an agent, the
+[always-on-agents reference implementation](https://github.com/temporal-sa/always-on-agents)
+continues its session Workflow as new when Temporal suggests it, carrying the
+session's state into the next run.
 [HISTORY_GROWTH.md](docs/HISTORY_GROWTH.md) has the limits, a
 [measured example](docs/HISTORY_GROWTH.md#measured-in-the-fleet-demo), and a
 [Continue-As-New sketch](docs/HISTORY_GROWTH.md#what-continue-as-new-looks-like-sketch).

@@ -1065,6 +1065,10 @@ def _fake_activities(refund_may_return: asyncio.Event):
             for tool in (TOOL_ORDER, TOOL_HISTORY, TOOL_POLICY, TOOL_MEMORY):
                 if tool not in done:
                     return AgentStep(action="use_tool", tool=tool)
+        if request.customer_id == "escalates":
+            return AgentStep(
+                action="decide", recommendation="escalate", rationale="large"
+            )
         if request.customer_id == "waits-for-answer":
             # Ask once, so the run waits on the customer_answer Signal.
             if not any(entry.get("kind") == "answer" for entry in working_memory):
@@ -1487,3 +1491,54 @@ def test_anthropic_text_reply_retries_but_a_refusal_does_not(monkeypatch) -> Non
         model._anthropic_step(_request(8000), [], "key")
     assert refusal.value.type == "AnthropicRefusal"
     assert refusal.value.non_retryable
+
+
+async def _check_approval_deadline(temporal: str) -> None:
+    from temporalio.testing import WorkflowEnvironment
+    from temporalio.worker import Worker
+
+    refund_may_return = asyncio.Event()
+    refund_may_return.set()
+    async with await WorkflowEnvironment.start_local(
+        dev_server_existing_path=temporal
+    ) as env:
+        queue = f"deadline-test-{uuid.uuid4().hex[:8]}"
+        async with Worker(
+            env.client,
+            task_queue=queue,
+            workflows=[RefundWorkflow],
+            activities=_fake_activities(refund_may_return),
+        ):
+            request = replace(
+                _request(8000), customer_id="escalates", approval_timeout_seconds=1
+            )
+            # No approval arrives: the request expires and nothing is refunded.
+            expired = await env.client.start_workflow(
+                RefundWorkflow.run,
+                request,
+                id=f"deadline-expired-{queue}",
+                task_queue=queue,
+            )
+            result = await asyncio.wait_for(expired.result(), timeout=15)
+            assert result.status == "expired"
+            assert result.refund_id == "none"
+            progress = await expired.query(RefundWorkflow.progress)
+            assert progress["phase"] == "approval_expired"
+
+            # Approval before the deadline: the refund goes ahead.
+            approved = await env.client.start_workflow(
+                RefundWorkflow.run,
+                replace(request, approval_timeout_seconds=60),
+                id=f"deadline-approved-{queue}",
+                task_queue=queue,
+            )
+            await approved.signal(RefundWorkflow.approve, "ok")
+            result = await asyncio.wait_for(approved.result(), timeout=15)
+            assert result.refund_id == "re_test"
+
+
+def test_escalation_expires_without_approval_and_refunds_nothing() -> None:
+    temporal = shutil.which("temporal")
+    if temporal is None:
+        pytest.skip("needs the temporal CLI on PATH")
+    asyncio.run(_check_approval_deadline(temporal))

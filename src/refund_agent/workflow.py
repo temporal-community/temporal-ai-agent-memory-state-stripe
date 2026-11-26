@@ -122,7 +122,31 @@ class RefundWorkflow:
                 )
                 self._phase = "waiting_for_approval"
                 # DURABLE WAIT: no Worker process has to remain alive here.
-                await workflow.wait_condition(lambda: self.approved)
+                # APPROVAL DEADLINE: an escalated refund waits for a person, but
+                # not forever (request.approval_timeout_seconds, 24 hours by
+                # default). If no approval arrives in time, the request expires:
+                # no refund is issued, and the Workflow closes with that outcome
+                # recorded. The deadline is a durable timer, so it holds across
+                # Worker restarts with no process waiting on it.
+                try:
+                    await workflow.wait_condition(
+                        lambda: self.approved,
+                        timeout=timedelta(seconds=request.approval_timeout_seconds),
+                        timeout_summary="Approval deadline",
+                    )
+                except TimeoutError:
+                    self._phase = "approval_expired"
+                    workflow.logger.info(
+                        "EXECUTION STATE | phase=approval_expired | no refund issued"
+                    )
+                    return RefundResult(
+                        refund_id="none",
+                        status="expired",
+                        amount_cents=request.amount_cents,
+                        idempotency_key="none",
+                        activity_attempt=0,
+                        mode="expired",
+                    )
                 workflow.logger.info(
                     f"EXECUTION STATE | phase=approved note={self.approval_note}"
                 )
@@ -279,7 +303,7 @@ class RefundWorkflow:
 
         A running Worker answers a Query from the Workflow's current state.
         Phases: deciding, waiting_for_answer, waiting_for_approval,
-        issuing_refund, denied, completed.
+        approval_expired, issuing_refund, denied, cancelled, completed.
         """
 
         return {
